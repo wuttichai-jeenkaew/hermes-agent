@@ -1296,23 +1296,34 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (!ev.payload) {
           return
         }
+
         const requestId = ev.payload.request_id
+
         if (typeof requestId !== 'string' || !requestId.trim()) {
           setStatus('approval unavailable')
+
           return
         }
+
         const description = String(ev.payload.description ?? 'dangerous command')
+
         const rawChoices = Array.isArray(ev.payload.choices)
           ? ev.payload.choices.filter((choice): choice is string => typeof choice === 'string')
           : undefined
+
         const allowPermanent = ev.payload.allow_permanent === true
         const allowSession = ev.payload.allow_session === true
-        const createdAt = typeof ev.payload.created_at === 'number' && Number.isFinite(ev.payload.created_at)
-          ? ev.payload.created_at
-          : undefined
-        const expiresAt = typeof ev.payload.expires_at === 'number' && Number.isFinite(ev.payload.expires_at)
-          ? ev.payload.expires_at
-          : undefined
+
+        const createdAt =
+          typeof ev.payload.created_at === 'number' && Number.isFinite(ev.payload.created_at)
+            ? ev.payload.created_at
+            : undefined
+
+        const expiresAt =
+          typeof ev.payload.expires_at === 'number' && Number.isFinite(ev.payload.expires_at)
+            ? ev.payload.expires_at
+            : undefined
+
         const nextApproval: ApprovalReq = {
           allowPermanent,
           allowSession,
@@ -1326,14 +1337,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
 
         patchOverlayState(prev => {
-          const queue = prev.approvalQueue?.length
-            ? prev.approvalQueue
-            : prev.approval
-              ? [prev.approval]
-              : []
+          const queue = prev.approvalQueue?.length ? prev.approvalQueue : prev.approval ? [prev.approval] : []
+
           if (queue.some(item => item.requestId === requestId)) {
             return prev
           }
+
           return {
             ...prev,
             approval: prev.approval ?? nextApproval,

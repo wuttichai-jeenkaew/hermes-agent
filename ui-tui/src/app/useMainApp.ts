@@ -148,7 +148,7 @@ export async function startPromptLiveSession({
 }
 
 export function approvalResponseResolved(result: unknown): boolean {
-  return typeof result === 'object' && result !== null && (result as { resolved?: unknown }).resolved === 1;
+  return typeof result === 'object' && result !== null && (result as { resolved?: unknown }).resolved === 1
 }
 
 export function useMainApp(gw: GatewayClient) {
@@ -1036,18 +1036,21 @@ export function useMainApp(gw: GatewayClient) {
       params: Record<string, unknown>,
       done: () => void,
       isSuccessful: (result: Record<string, any>) => boolean = result => Boolean(result)
-    ) => rpc(method, params).then(result => {
-      if (result && isSuccessful(result)) {
-        done()
-      }
-      return result
-    }),
+    ) =>
+      rpc(method, params).then(result => {
+        if (result && isSuccessful(result)) {
+          done()
+        }
+
+        return result
+      }),
     [rpc]
   )
 
   const answerApproval = useCallback(
     (choice: string) => {
       const requestId = overlay.approval?.requestId
+
       return respondWith(
         'approval.respond',
         {
@@ -1075,15 +1078,19 @@ export function useMainApp(gw: GatewayClient) {
 
       const requestId = overlay.sudo.requestId
 
-      return respondWith('sudo.respond', {
-        password: pw,
-        profile: ui.info?.profile_name || 'default',
-        request_id: requestId,
-        session_id: ui.sid
-      }, () => {
-        patchOverlayState({ sudo: null })
-        patchUiState({ status: 'running…' })
-      })
+      return respondWith(
+        'sudo.respond',
+        {
+          password: pw,
+          profile: ui.info?.profile_name || 'default',
+          request_id: requestId,
+          session_id: ui.sid
+        },
+        () => {
+          patchOverlayState({ sudo: null })
+          patchUiState({ status: 'running…' })
+        }
+      )
     },
     [overlay.sudo, respondWith, ui.info?.profile_name, ui.sid]
   )
@@ -1096,15 +1103,19 @@ export function useMainApp(gw: GatewayClient) {
 
       const requestId = overlay.secret.requestId
 
-      return respondWith('secret.respond', {
-        profile: ui.info?.profile_name || 'default',
-        request_id: requestId,
-        session_id: ui.sid,
-        value
-      }, () => {
-        patchOverlayState({ secret: null })
-        patchUiState({ status: 'running…' })
-      })
+      return respondWith(
+        'secret.respond',
+        {
+          profile: ui.info?.profile_name || 'default',
+          request_id: requestId,
+          session_id: ui.sid,
+          value
+        },
+        () => {
+          patchOverlayState({ secret: null })
+          patchUiState({ status: 'running…' })
+        }
+      )
     },
     [overlay.secret, respondWith, ui.info?.profile_name, ui.sid]
   )

@@ -170,17 +170,18 @@ export const resetFlowOverlays = () =>
 
 /** Remove one resolved approval and promote the next server request, if any. */
 export const dismissApproval = (requestId?: string) =>
-  $overlayState.set((() => {
-    const current = $overlayState.get()
-    const queue = current.approvalQueue?.length
-      ? current.approvalQueue
-      : current.approval
-        ? [current.approval]
-        : []
-    const remaining = requestId ? queue.filter(item => item.requestId !== requestId) : queue.slice(1)
-    return {
-      ...current,
-      approval: remaining[0] ?? null,
-      approvalQueue: remaining
-    }
-  })())
+  $overlayState.set(
+    (() => {
+      const current = $overlayState.get()
+
+      const queue = current.approvalQueue?.length ? current.approvalQueue : current.approval ? [current.approval] : []
+
+      const remaining = requestId ? queue.filter(item => item.requestId !== requestId) : queue.slice(1)
+
+      return {
+        ...current,
+        approval: remaining[0] ?? null,
+        approvalQueue: remaining
+      }
+    })()
+  )

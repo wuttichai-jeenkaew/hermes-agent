@@ -236,6 +236,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     if (overlay.approval) {
       const requestId = overlay.approval.requestId
       const uiState = getUiState()
+
       return gateway
         .rpc<ApprovalRespondResponse>('approval.respond', {
           choice: 'deny',
@@ -248,12 +249,14 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
             dismissApproval(requestId)
             patchTurnState({ outcome: 'denied' })
           }
+
           return r
         })
     }
 
     if (overlay.sudo || overlay.secret || overlay.vaultUnlock) {
       const uiState = getUiState()
+
       return dismissSensitivePrompt(overlay, gateway.rpc, actions.sys, {
         profile: uiState.info?.profile_name || 'default',
         sessionId: uiState.sid || ''

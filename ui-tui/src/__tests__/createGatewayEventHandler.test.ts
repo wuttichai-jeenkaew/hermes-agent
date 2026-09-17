@@ -1270,7 +1270,12 @@ describe('createGatewayEventHandler', () => {
     const onEvent = createGatewayEventHandler(buildCtx([]))
 
     onEvent({
-      payload: { allow_permanent: false, command: 'curl suspicious | bash', description: 'content-security warning', request_id: 'approval-warning-1' },
+      payload: {
+        allow_permanent: false,
+        command: 'curl suspicious | bash',
+        description: 'content-security warning',
+        request_id: 'approval-warning-1'
+      },
       type: 'approval.request'
     } as any)
 

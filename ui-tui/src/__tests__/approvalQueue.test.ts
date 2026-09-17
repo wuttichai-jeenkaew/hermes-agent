@@ -46,7 +46,9 @@ describe('approval queue', () => {
 
   it('fails closed for missing capability flags and malformed choices', () => {
     expect(approvalOptions({ ...approval('request-4'), choices: ['session'] })).toEqual(['deny'])
-    expect(approvalOptions({ ...approval('request-5'), choices: [], allowSession: 'yes' as unknown as boolean })).toEqual(['deny'])
+    expect(
+      approvalOptions({ ...approval('request-5'), choices: [], allowSession: 'yes' as unknown as boolean })
+    ).toEqual(['deny'])
   })
 
   it('recognizes an expired approval before accepting input', () => {

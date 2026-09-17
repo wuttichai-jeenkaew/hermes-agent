@@ -671,6 +671,7 @@ function flushBuffer(buffer: string, styles: AnsiCode[], stylePool: StylePool, o
     // the preceding rendered grapheme, including across style-run boundaries.
     if (width === 0 && previous && previous.width > 0) {
       previous.value += grapheme
+
       continue
     }
 

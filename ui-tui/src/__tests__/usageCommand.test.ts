@@ -182,7 +182,7 @@ describe('/usage slash command', () => {
 
     await run('')
 
-    const body = (panel.mock.calls.find(c => c[0] === 'Usage')?.[1] as { text?: string }[] | undefined ?? [])
+    const body = ((panel.mock.calls.find(c => c[0] === 'Usage')?.[1] as { text?: string }[] | undefined) ?? [])
       .map(s => s.text ?? '')
       .join('\\n')
 

@@ -18,6 +18,7 @@ type ApprovalChoice = 'always' | 'deny' | 'once' | 'session'
 
 export function approvalOptions(req: ApprovalReq): readonly ApprovalChoice[] {
   const hasExplicitChoices = Array.isArray(req.choices)
+
   const raw = hasExplicitChoices
     ? req.choices!
     : req.smartDenied
@@ -25,16 +26,19 @@ export function approvalOptions(req: ApprovalReq): readonly ApprovalChoice[] {
       : req.allowSession === true && req.allowPermanent === true
         ? APPROVAL_OPTS
         : req.allowSession === true
-          ? ['once', 'session', 'deny'] as const
-          : ['once', 'deny'] as const
-  const filtered = raw.filter((choice): choice is ApprovalChoice => APPROVAL_OPTS.includes(choice as ApprovalChoice))
+          ? (['once', 'session', 'deny'] as const)
+          : (['once', 'deny'] as const)
+
+  const filtered = raw
+    .filter((choice): choice is ApprovalChoice => APPROVAL_OPTS.includes(choice as ApprovalChoice))
     .filter(choice => choice !== 'session' || (req.allowSession === true && req.smartDenied !== true))
     .filter(choice => choice !== 'always' || (req.allowPermanent === true && req.smartDenied !== true))
+
   return filtered.length > 0 ? filtered : ['deny']
 }
 
 export function isApprovalExpired(req: ApprovalReq, nowSeconds = Date.now() / 1000): boolean {
-  return typeof req.expiresAt === 'number' && Number.isFinite(req.expiresAt) && nowSeconds >= req.expiresAt;
+  return typeof req.expiresAt === 'number' && Number.isFinite(req.expiresAt) && nowSeconds >= req.expiresAt
 }
 
 type ApprovalKey = {
@@ -97,6 +101,7 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
     if (expired) {
       return
     }
+
     const action = approvalAction(ch, key, sel, opts)
 
     if (action.kind === 'choose') {
@@ -142,16 +147,20 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
 
       {expired ? (
         <Text color={t.color.muted}>approval expired · no action available</Text>
-      ) : opts.map((o, i) => (
-        <Text key={o}>
-          <Text color={t.color.muted} {...chipRowProps(t, sel === i)}>
-            {sel === i ? '▸ ' : '  '}
-            {i + 1}. {LABELS[o]}
+      ) : (
+        opts.map((o, i) => (
+          <Text key={o}>
+            <Text color={t.color.muted} {...chipRowProps(t, sel === i)}>
+              {sel === i ? '▸ ' : '  '}
+              {i + 1}. {LABELS[o]}
+            </Text>
           </Text>
-        </Text>
-      ))}
+        ))
+      )}
 
-      {!expired ? <Text color={t.color.muted}>↑/↓ select · Enter confirm · 1-{opts.length} quick pick · Esc/Ctrl+C deny</Text> : null}
+      {!expired ? (
+        <Text color={t.color.muted}>↑/↓ select · Enter confirm · 1-{opts.length} quick pick · Esc/Ctrl+C deny</Text>
+      ) : null}
     </Box>
   )
 }
