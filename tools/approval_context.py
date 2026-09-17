@@ -61,12 +61,38 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
         from hermes_cli.lifecycle import invoke_hook
     except Exception:
         return  # plugin system unavailable (bare tool-only imports, minimal tests)
+    safe_kwargs = dict(kwargs)
+    for field in (
+        "command",
+        "description",
+        "title",
+        "message",
+        "reason",
+        "detail",
+        "user_snippet",
+    ):
+        value = safe_kwargs.get(field)
+        if not isinstance(value, str):
+            continue
+        try:
+            from agent.redact import redact_sensitive_text
+
+            safe_kwargs[field] = redact_sensitive_text(
+                value,
+                force=True,
+                redact_url_credentials=True,
+            )
+        except Exception:
+            # Observability must never become a secret egress path when the
+            # redactor is unavailable.
+            safe_kwargs[field] = "[REDACTED]"
     try:
-        kwargs.setdefault("turn_id", _approval_turn_id.get())
-        kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
-        if _approval_session_id.get():
-            kwargs.setdefault("session_id", _approval_session_id.get())
-        invoke_hook(hook_name, **kwargs)
+        safe_kwargs.setdefault("turn_id", _approval_turn_id.get())
+        safe_kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
+        _session_id = _approval_session_id.get()
+        if _session_id:
+            safe_kwargs.setdefault("session_id", _session_id)
+        invoke_hook(hook_name, **safe_kwargs)
     except Exception as exc:
         # invoke_hook() swallows per-callback errors; this is the dispatch layer itself failing.
         logger.debug("Approval hook %s dispatch failed: %s", hook_name, exc)

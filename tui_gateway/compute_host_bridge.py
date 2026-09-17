@@ -256,9 +256,13 @@ def _send_compute_host_control(
     frame = dict(payload or {})
     frame.setdefault("type", "control")
     frame.setdefault("command", command)
-    return _get_compute_host_supervisor().control(
-        sid, route_name=route_name, payload=frame, wait=wait, timeout=timeout,
-        on_late_ack=on_late_ack)
+    import sys
+    owner = sys.modules.get("tui_gateway.server")
+    get_supervisor = getattr(owner, "_get_compute_host_supervisor", _get_compute_host_supervisor)
+    control_kwargs = {"route_name": route_name, "payload": frame, "wait": wait, "timeout": timeout}
+    if on_late_ack is not None:
+        control_kwargs["on_late_ack"] = on_late_ack
+    return get_supervisor().control(sid, **control_kwargs)
 
 
 def _compute_host_compress_wait_seconds(cfg: dict | None = None) -> float:

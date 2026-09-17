@@ -3841,8 +3841,10 @@ class TelegramAdapter(BasePlatformAdapter):
             approval_id = next(self._approval_counter)
             buttons = [InlineKeyboardButton(label, callback_data=f"ea:{choice}:{approval_id}")
                        for label, choice, _ in prompt.actions]
+            request_id = (prompt.metadata or {}).get("approval_request_id")
+            state_value = (prompt.session_key, str(request_id)) if request_id else prompt.session_key
             return prompt.text, InlineKeyboardMarkup(self._rows_of_two(buttons)), (
-                lambda msg: self._approval_state.__setitem__(approval_id, prompt.session_key))
+                lambda msg: self._approval_state.__setitem__(approval_id, state_value))
         return await self._send_prompt(
             "send_exec_approval", prompt.chat_id, prompt.metadata, build, parse_mode=ParseMode.HTML,
             thread_id=self._metadata_thread_id(prompt.metadata), reply_to_mode=self._reply_to_mode)
@@ -4311,11 +4313,15 @@ class TelegramAdapter(BasePlatformAdapter):
         except (ValueError, IndexError):
             await query.answer(text="Invalid approval data.")
             return
-        session_key = await self._claim_callback_state(
+        claimed_state = await self._claim_callback_state(
             query, cb, self._approval_state, approval_id, "⛔ You are not authorized to approve commands.",
             "This approval has already been resolved.")
-        if not session_key:
+        if not claimed_state:
             return
+        if isinstance(claimed_state, tuple):
+            session_key, request_id = claimed_state
+        else:
+            session_key, request_id = str(claimed_state), None
         user_display = getattr(query.from_user, "first_name", "User")
         # Resolve FIRST (unblocks the agent thread), render after: a tap landing after the wait timed out
         # (count == 0) must NOT claim "Approved" — the command was already denied.
@@ -4324,7 +4330,11 @@ class TelegramAdapter(BasePlatformAdapter):
             # the approval wait timed out (count == 0) must NOT claim "Approved" — the command was already
             # denied and will not run (#63501 regression follow-up: 60s waits made stale taps common).
             from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(session_key, choice)
+            count = resolve_gateway_approval(
+                session_key,
+                choice,
+                request_id=request_id,
+            ) if request_id else resolve_gateway_approval(session_key, choice)
             logger.info(
                 "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)", count, session_key, choice, user_display)
         except Exception as exc:

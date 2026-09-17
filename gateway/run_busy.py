@@ -450,10 +450,16 @@ class GatewayBusySessionMixin:
                     _approval_handler = (
                         self._handle_approve_command if _verb == "approve" else self._handle_deny_command
                     )
-                    # Synthesize "/approve [args]" / "/deny" so the slash handlers parse modifiers via
-                    # event.get_command_args(). Always a literal "/": is_command()/get_command_args()
-                    # don't recognize per-platform display prefixes ("!" on Slack/Matrix).
-                    event.text = f"/{_verb} {_normalized_args}".rstrip()
+                    from tools.approval import list_gateway_approvals
+                    _synth = f"/{_verb}"
+                    _pending_items = list_gateway_approvals(session_key)
+                    if len(_pending_items) == 1:
+                        _text_request_id = str(_pending_items[0].get("request_id") or "").strip()
+                        if _text_request_id:
+                            _synth = f"{_synth} {_text_request_id}"
+                    if _normalized_args:
+                        _synth = f"{_synth} {_normalized_args}"
+                    event.text = _synth
                     _reply = await _approval_handler(event)
                     logger.info(
                         "Approval response via plain text: session=%s verb=%s args=%r",

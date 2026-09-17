@@ -71,8 +71,8 @@ from gateway.platforms.qqbot.chunked_upload import (
     ChunkedUploader, UploadDailyLimitExceededError, UploadFileTooLargeError)
 from gateway.platforms.qqbot.keyboards import (
     ApprovalRequest, InlineKeyboard, InteractionEvent, build_approval_keyboard,
-    build_update_prompt_keyboard, parse_approval_button_data, parse_interaction_event,
-    parse_update_prompt_button_data)
+    build_update_prompt_keyboard, parse_approval_button_data, parse_approval_button_data_exact,
+    parse_interaction_event, parse_update_prompt_button_data)
 from gateway.platforms._shared import get_scoped_secret as _resolve_qq_secret
 
 
@@ -498,6 +498,12 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         try:
             return asyncio.get_running_loop().create_task(coro)
         except RuntimeError:
+            # The caller has already created the coroutine.  Close it when
+            # there is no running loop so synchronous/test dispatch does not
+            # leak an un-awaited coroutine (and its captured state).
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
             return None
 
     def _close_ws_soon(self) -> None:
@@ -682,16 +688,16 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         return self._source_session_key(self.build_source(chat_id=chat, chat_type=event.scene))
 
     async def _default_interaction_dispatch(self, event: InteractionEvent) -> None:
-        """Default interaction callback: ``approve:<session_key>:<decision>`` →
+        """Default interaction callback: ``approve:<session_key>:rid:<request_id>:<decision>`` →
         tools.approval.resolve_gateway_approval; ``update_prompt:<answer>`` →
         ``~/.hermes/.update_response``; anything else is ignored at DEBUG."""
         button_data = event.button_data
         if not button_data:
             return
 
-        approval = parse_approval_button_data(button_data)
-        if approval is not None:
-            session_key, decision = approval
+        approval_exact = parse_approval_button_data_exact(button_data)
+        if approval_exact:
+            session_key, request_id, decision = approval_exact
             choice = self._APPROVAL_BUTTON_TO_CHOICE.get(decision)
             if choice is None:
                 logger.warning("[%s] Unknown approval decision %r (session=%s)", self._log_tag, decision, session_key)
@@ -703,7 +709,11 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 return
             try:
                 from tools.approval import resolve_gateway_approval  # lazy: keep adapter light
-                count = resolve_gateway_approval(session_key, choice)
+                count = resolve_gateway_approval(
+                    session_key,
+                    choice,
+                    request_id=request_id,
+                )
                 logger.info(
                     "[%s] Button resolved %d approval(s) for session %s (choice=%s, operator=%s)",
                     self._log_tag, count, session_key, choice, event.operator_openid)
@@ -1459,12 +1469,24 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             return SendResult(success=False, error=str(exc) or type(exc).__name__)
 
     async def send_approval_request(
-        self, chat_id: str, req: ApprovalRequest, reply_to: Optional[str] = None) -> SendResult:
+        self, chat_id: str, req: ApprovalRequest, reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a 3-button approval request (allow-once / allow-always / deny);
-        clicks come back as INTERACTION_CREATE decoded by parse_approval_button_data."""
+        clicks come back as INTERACTION_CREATE decoded by parse_approval_button_data_exact."""
         from gateway.platforms.qqbot.keyboards import build_approval_text
-        keyboard = build_approval_keyboard(req.session_key, allow_permanent=getattr(req, "allow_permanent", True))
-        return await self.send_with_keyboard(chat_id, build_approval_text(req), keyboard, reply_to=reply_to)
+        request_id = (metadata or {}).get("approval_request_id") or getattr(req, "request_id", "")
+        keyboard = build_approval_keyboard(
+            req.session_key,
+            allow_permanent=getattr(req, "allow_permanent", True),
+            request_id=str(request_id or ""),
+        )
+        return await self.send_with_keyboard(
+            chat_id,
+            build_approval_text(req),
+            keyboard,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
 
     # Cross-adapter gateway contract: gateway/run.py detects send_exec_approval /
     # send_update_prompt on the adapter class for button-based approval/update UX.
@@ -1481,10 +1503,10 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         req = ApprovalRequest(
             session_key=prompt.session_key, title="Execute this command?", description=description,
             command_preview=prompt.command, timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,
-            allow_permanent="always" in prompt.choices)
+            request_id=str((prompt.metadata or {}).get("approval_request_id") or ""), allow_permanent="always" in prompt.choices)
         # QQ requires a msg_id for passive replies; the last inbound id is the natural one.
         return await self.send_approval_request(
-            prompt.chat_id, req, reply_to=self._last_msg_id.get(prompt.chat_id))
+            prompt.chat_id, req, reply_to=self._last_msg_id.get(prompt.chat_id), metadata=prompt.metadata)
 
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "", session_key: str = "",

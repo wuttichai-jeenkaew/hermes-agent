@@ -22,7 +22,9 @@ import {
 } from "react-router";
 import {
   Activity,
+  Archive,
   BarChart3,
+  Gauge,
   BookOpen,
   Clock,
   Code,
@@ -69,6 +71,7 @@ import { useSidebarStatus } from "@/hooks/useSidebarStatus";
 import { AuthWidget } from "@/components/AuthWidget";
 import { PageHeaderProvider } from "@/contexts/PageHeaderProvider";
 import { ProfileProvider } from "@/contexts/ProfileProvider";
+import { RemoteApprovalsProvider, useRemoteApprovals } from "@/contexts/RemoteApprovals";
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { ProfileSwitcher } from "@/components/ProfileSwitcher";
 import { ProfileScopeBanner } from "@/components/ProfileScopeBanner";
@@ -81,9 +84,12 @@ const ConfigPage = lazy(() => import("@/pages/ConfigPage"));
 const DocsPage = lazy(() => import("@/pages/DocsPage"));
 const EnvPage = lazy(() => import("@/pages/EnvPage"));
 const FilesPage = lazy(() => import("@/pages/FilesPage"));
+const ArtifactsPage = lazy(() => import("@/pages/ArtifactsPage"));
 const SessionsPage = lazy(() => import("@/pages/SessionsPage"));
 const LogsPage = lazy(() => import("@/pages/LogsPage"));
 const AnalyticsPage = lazy(() => import("@/pages/AnalyticsPage"));
+const UsageQuotaPage = lazy(() => import("@/pages/UsageQuotaPage"));
+const PendingApprovalsPage = lazy(() => import("@/pages/PendingApprovalsPage"));
 const ModelsPage = lazy(() => import("@/pages/ModelsPage"));
 const CronPage = lazy(() => import("@/pages/CronPage"));
 const ProfilesPage = lazy(() => import("@/pages/ProfilesPage"));
@@ -95,7 +101,11 @@ const PairingPage = lazy(() => import("@/pages/PairingPage"));
 const ChannelsPage = lazy(() => import("@/pages/ChannelsPage"));
 const WebhooksPage = lazy(() => import("@/pages/WebhooksPage"));
 const SystemPage = lazy(() => import("@/pages/SystemPage"));
-const ChatPage = lazy(() => import("@/pages/ChatPage"));
+const NativeChatPage = lazy(() => import("@/pages/NativeChatPage"));
+// Keep the PTY implementation importable as a compatibility fallback. Do not
+// remove ChatPage: existing deep links/tests and an eventual feature flag rely
+// on the legacy surface remaining available.
+const LegacyChatPage = lazy(() => import("@/pages/ChatPage"));
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -106,8 +116,14 @@ import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { sharedGatewayProfiles, sharedGatewayRestartDescription } from "@/lib/shared-gateway";
+import {
+  getDashboardHomePath,
+  getDashboardSidebarMode,
+  shouldRenderMobileNavigationHeader,
+} from "@/lib/dashboard-shell";
 import { api } from "@/lib/api";
 import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
+import { isRemoteApprovalExpired } from "@/lib/remote-approvals";
 
 function RouteFallback({ label = "Loading…" }: { label?: string }) {
   return (
@@ -125,7 +141,7 @@ function RouteFallback({ label = "Loading…" }: { label?: string }) {
 }
 
 function RootRedirect() {
-  return <Navigate to="/sessions" replace />;
+  return <Navigate to={getDashboardHomePath(isDashboardEmbeddedChatEnabled())} replace />;
 }
 
 function UnknownRouteFallback({ pluginsLoading }: { pluginsLoading: boolean }) {
@@ -158,7 +174,10 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
   "/sessions": SessionsPage,
   "/files": FilesPage,
+  "/artifacts": ArtifactsPage,
   "/analytics": AnalyticsPage,
+  "/usage-quota": UsageQuotaPage,
+  "/approvals": PendingApprovalsPage,
   "/models": ModelsPage,
   "/logs": LogsPage,
   "/cron": CronPage,
@@ -192,11 +211,22 @@ const BUILTIN_NAV_REST: NavItem[] = [
     icon: MessageSquare,
   },
   { path: "/files", label: "Files", icon: FolderOpen },
+  { path: "/artifacts", label: "Artifacts", icon: Archive },
   {
     path: "/analytics",
     labelKey: "analytics",
     label: "Analytics",
     icon: BarChart3,
+  },
+  {
+    path: "/usage-quota",
+    label: "Usage & Quota",
+    icon: Gauge,
+  },
+  {
+    path: "/approvals",
+    label: "Pending approvals",
+    icon: ShieldCheck,
   },
   {
     path: "/models",
@@ -385,6 +415,7 @@ export default function App() {
       return false;
     }
   });
+  const [chatSidebarExpanded, setChatSidebarExpanded] = useState(false);
   const toggleCollapsed = useCallback(() => {
     setCollapsed((prev) => {
       const next = !prev;
@@ -395,12 +426,28 @@ export default function App() {
     });
   }, []);
   const isMobile = useBelowBreakpoint(1024);
-  const isDesktopCollapsed = collapsed && !isMobile;
   const tooltipWarmRef = useRef(0);
   const sidebarStatus = useSidebarStatus();
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
+  const showMobileNavigationHeader = shouldRenderMobileNavigationHeader(pathname, isMobile);
+  const sidebarMode = getDashboardSidebarMode(
+    pathname,
+    isMobile,
+    collapsed,
+    chatSidebarExpanded,
+  );
+  const isDesktopCollapsed = sidebarMode !== "expanded" && !isMobile;
+  const toggleSidebar = useCallback(() => {
+    if (isChatRoute && !isMobile) {
+      setChatSidebarExpanded((expanded) => !expanded);
+      return;
+    }
+    toggleCollapsed();
+  }, [isChatRoute, isMobile, toggleCollapsed]);
+  // Explicit compatibility escape hatch while the native surface rolls out.
+  const useLegacyChat = new URLSearchParams(window.location.search).get("chat_ui") === "pty";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
   // Defer mounting the persistent chat host (and its xterm chunk) until the
   // user has actually opened /chat at least once. Sticky after that so the
@@ -512,6 +559,7 @@ export default function App() {
 
   return (
     <ProfileProvider>
+    <RemoteApprovalsProvider>
     <div
       data-layout-variant={layoutVariant}
       className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-background-base text-text-primary antialiased"
@@ -525,36 +573,38 @@ export default function App() {
         <PluginSlot name="backdrop" />
       </div>
 
-      <header
-        className={cn(
-          "lg:hidden fixed top-0 left-0 right-0 z-40 min-h-14",
-          "flex items-center gap-2 px-4 py-2",
-          "border-b border-current/20",
-          "bg-background-base",
-        )}
-        style={{
-          background:
-            "var(--component-header-background, var(--background-base))",
-          borderImage: "var(--component-header-border-image)",
-          clipPath: "var(--component-header-clip-path)",
-        }}
-      >
-        <Button
-          ghost
-          size="icon"
-          onClick={() => setMobileOpen(true)}
-          aria-label={t.app.openNavigation}
-          aria-expanded={mobileOpen}
-          aria-controls="app-sidebar"
-          className="text-text-secondary hover:text-midground"
+      {showMobileNavigationHeader && (
+        <header
+          className={cn(
+            "lg:hidden fixed top-0 left-0 right-0 z-40 min-h-14",
+            "flex items-center gap-2 px-4 py-2",
+            "border-b border-current/20",
+            "bg-background-base",
+          )}
+          style={{
+            background:
+              "var(--component-header-background, var(--background-base))",
+            borderImage: "var(--component-header-border-image)",
+            clipPath: "var(--component-header-clip-path)",
+          }}
         >
-          <Menu />
-        </Button>
+          <Button
+            ghost
+            size="icon"
+            onClick={() => setMobileOpen(true)}
+            aria-label={t.app.openNavigation}
+            aria-expanded={mobileOpen}
+            aria-controls="app-sidebar"
+            className="text-text-secondary hover:text-midground"
+          >
+            <Menu />
+          </Button>
 
-        <Typography className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground">
-          {t.app.brand}
-        </Typography>
-      </header>
+          <Typography className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground">
+            {t.app.brand}
+          </Typography>
+        </header>
+      )}
 
       {mobileOpen && (
         <Button
@@ -572,7 +622,9 @@ export default function App() {
           fixed lg:hidden header is h-14/z-40; previously each banner carried
           its own mt-14 AND the content kept pt-14, so two visible banners
           stacked three offsets (NS-656 review P3). One spacer, applied once. */}
-      <div aria-hidden className="h-14 shrink-0 lg:hidden" />
+      {showMobileNavigationHeader && (
+        <div aria-hidden className="h-14 shrink-0 lg:hidden" />
+      )}
       <PluginSlot name="header-banner" />
       <ProfileScopeBanner />
       <MemoryPressureBanner status={sidebarStatus} />
@@ -582,6 +634,8 @@ export default function App() {
           <aside
             id="app-sidebar"
             aria-label={t.app.navigation}
+            data-sidebar-mode={sidebarMode}
+            data-sidebar-route={isChatRoute ? "chat" : "page"}
             className={cn(
               "fixed top-0 left-0 z-50 flex h-dvh max-h-dvh w-64 min-h-0 flex-col font-sans",
               "border-r border-current/20",
@@ -590,7 +644,7 @@ export default function App() {
               mobileOpen ? "translate-x-0" : "-translate-x-full",
               "lg:sticky lg:top-0 lg:translate-x-0 lg:shrink-0 lg:overflow-hidden",
               "lg:transition-[width] lg:duration-300 lg:ease-[cubic-bezier(0.23,1,0.32,1)]",
-              collapsed && "lg:w-14",
+              isDesktopCollapsed && "lg:w-14",
             )}
             style={{
               background:
@@ -603,13 +657,13 @@ export default function App() {
               className={cn(
                 "flex h-14 shrink-0 items-center gap-2",
                 "border-b border-current/20",
-                collapsed ? "lg:justify-center lg:px-0" : "px-4 justify-between",
+                isDesktopCollapsed ? "lg:justify-center lg:px-0" : "px-4 justify-between",
               )}
             >
               <div
                 className={cn(
                   "flex items-center gap-2",
-                  collapsed && "lg:hidden",
+                  isDesktopCollapsed && "lg:hidden",
                 )}
               >
                 <PluginSlot name="header-left" />
@@ -634,13 +688,13 @@ export default function App() {
               <Button
                 ghost
                 size="icon"
-                onClick={toggleCollapsed}
+                onClick={toggleSidebar}
                 aria-label={
-                  collapsed ? t.common.expand : t.common.collapse
+                  isDesktopCollapsed ? t.common.expand : t.common.collapse
                 }
                 className="hidden lg:flex text-text-secondary hover:text-midground"
               >
-                {collapsed ? (
+                {isDesktopCollapsed ? (
                   <PanelLeftOpen className="h-4 w-4" />
                 ) : (
                   <PanelLeftClose className="h-4 w-4" />
@@ -813,7 +867,11 @@ export default function App() {
                           ) : null
                         }
                       >
-                        <ChatPage isActive={isChatRoute} />
+                        {useLegacyChat ? (
+                          <LegacyChatPage isActive={isChatRoute} />
+                        ) : (
+                          <NativeChatPage onOpenNavigation={() => setMobileOpen(true)} />
+                        )}
                       </Suspense>
                     </div>
                   ) : isChatRoute ? (
@@ -828,6 +886,7 @@ export default function App() {
 
       <PluginSlot name="overlay" />
     </div>
+    </RemoteApprovalsProvider>
     </ProfileProvider>
   );
 }
@@ -855,6 +914,10 @@ function SidebarNavLink({
   t,
 }: SidebarNavLinkProps) {
   const { path, label, labelKey, icon: Icon } = item;
+  const { approvals } = useRemoteApprovals();
+  const pendingApprovalCount = path === "/approvals"
+    ? approvals.filter((approval) => !isRemoteApprovalExpired(approval)).length
+    : 0;
   const [hovered, setHovered] = useState(false);
   const [tooltipAnchor, setTooltipAnchor] = useState<HTMLElement | null>(null);
 
@@ -910,6 +973,19 @@ function SidebarNavLink({
             >
               {navLabel}
             </span>
+
+            {pendingApprovalCount > 0 && (
+              <span
+                aria-label={`${pendingApprovalCount} pending approval${pendingApprovalCount === 1 ? "" : "s"}`}
+                className={cn(
+                  "ml-auto min-w-5 rounded-full px-1.5 py-0.5 text-center text-[0.65rem] leading-none",
+                  "bg-warning text-background",
+                  collapsed && "lg:hidden",
+                )}
+              >
+                {pendingApprovalCount}
+              </span>
+            )}
 
             <span
               aria-hidden

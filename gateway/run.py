@@ -538,9 +538,21 @@ def _gateway_loop_exception_handler(
 def _redact_gateway_user_facing_secrets(text: str) -> str:
     """Secret redaction before text can leave the gateway for a chat platform: the shared egress scrub
     (``force=True`` holds even when ``security.redact_secrets`` is off; fails closed). See #23810."""
-    from agent.redact import redact_for_egress
+    from agent.redact import redact_sensitive_text
 
-    return redact_for_egress(text)
+    return redact_sensitive_text(
+        str(text or ""),
+        force=True,
+        redact_url_credentials=True,
+    )
+
+
+def _redact_clarify_choices(choices) -> list[str] | None:
+    if not choices:
+        return None
+    if not isinstance(choices, (list, tuple)):
+        return ["[REDACTED]"]
+    return [_redact_gateway_user_facing_secrets(str(choice)) for choice in choices]
 
 
 def _redact_approval_command(cmd: "str | None") -> str:
@@ -556,23 +568,33 @@ def _redact_approval_command(cmd: "str | None") -> str:
     """
     from agent.redact import redact_sensitive_text
 
-    return redact_sensitive_text(str(cmd or ""), force=True)
+    return redact_sensitive_text(str(cmd or ""), force=True, redact_url_credentials=True)
 
 
 def _format_exec_approval_fallback(
-    command: str, description: str, command_prefix: str, *, allow_permanent: bool = True,
-    allow_session: bool = True, smart_denied: bool = False) -> str:
+    command: str,
+    description: str,
+    command_prefix: str,
+    *,
+    request_id: str = "",
+    allow_permanent: bool = True,
+    allow_session: bool = True,
+    smart_denied: bool = False,
+) -> str:
     """Render the text fallback from approval capabilities, not platform names."""
     cmd_preview = command[:200] + "..." if len(command) > 200 else command
     heading = ("⚠️ **Smart DENY — owner override for one operation:**" if smart_denied
                else "⚠️ **Dangerous command requires approval:**")
 
-    choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
+    request_token = f" {request_id}" if request_id else ""
+    choices = [f"Reply `{command_prefix}approve{request_token}` to execute this one operation"]
     if not smart_denied and allow_session:
-        choices.append(f"`{command_prefix}approve session` to approve this pattern for the session")
+        choices.append(
+            f"`{command_prefix}approve{request_token} session` to approve this pattern for the session"
+        )
         if allow_permanent:
-            choices.append(f"`{command_prefix}approve always` to approve permanently")
-    choices.append(f"`{command_prefix}deny` to cancel")
+            choices.append(f"`{command_prefix}approve{request_token} always` to approve permanently")
+    choices.append(f"`{command_prefix}deny{request_token}` to cancel")
     return (
         f"{heading}\n```\n{cmd_preview}\n```\nReason: {description}\n\n"
         + ", ".join(choices[:-1]) + f", or {choices[-1]}.")

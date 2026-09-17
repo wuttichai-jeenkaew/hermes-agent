@@ -167,6 +167,12 @@ export interface ToolGeneratingPayload {
   name?: string
 }
 
+export interface ToolProgressPayload {
+  delta?: string
+  message_id?: string
+  tool_name?: string
+}
+
 /** `tui_gateway/tool_progress.py::_progress_output_risk`. */
 export interface ToolOutputRiskPayload {
   findings?: string[]
@@ -330,11 +336,15 @@ export interface ClarifyRequestPayload {
 /** `tui_gateway/server.py::_approval_request_payload` (command redacted server-side). */
 export interface ApprovalRequestPayload {
   allow_permanent?: boolean
+  allow_session?: boolean
   choices?: string[]
   command: string
+  created_at?: number
   description: string
+  expires_at?: number
   request_id?: string
   smart_denied?: boolean
+  title?: string
 }
 
 export interface SudoRequestPayload {
@@ -472,6 +482,7 @@ export const BACKEND_EVENT_NAMES = [
   'tool.complete',
   'tool.generating',
   'tool.output_risk',
+  'tool.progress',
   'tool.start',
   'tour.expire',
   'tour.request',
@@ -570,6 +581,7 @@ export interface BackendGatewayEventMap {
   'tool.complete': ToolCompletePayload
   'tool.generating': ToolGeneratingPayload
   'tool.output_risk': ToolOutputRiskPayload
+  'tool.progress': ToolProgressPayload
   'tool.start': ToolStartPayload
   'tour.expire': RequestExpirePayload
   'tour.request': Record<string, unknown>

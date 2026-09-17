@@ -1,0 +1,125 @@
+// @vitest-environment jsdom
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { MarkdownMessage } from "./MarkdownMessage";
+
+let container: HTMLDivElement;
+let root: Root;
+
+async function renderMessage(content: string, sessionId?: string) {
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+  await act(async () => root.render(<MarkdownMessage content={content} sessionId={sessionId} />));
+}
+
+afterEach(async () => {
+  await act(async () => root?.unmount());
+  container?.remove();
+  localStorage.clear();
+  vi.restoreAllMocks();
+});
+
+describe("MarkdownMessage", () => {
+  it("preserves plain text whitespace and newlines", async () => {
+    await renderMessage("first line\n  second line\n\nthird\n");
+    expect(container.querySelector("p")?.textContent).toBe(
+      "first line\n  second line\n\nthird\n",
+    );
+    expect(container.querySelector("p")?.className).toContain("whitespace-pre-wrap");
+  });
+
+  it("renders raw HTML as text rather than executable markup", async () => {
+    await renderMessage("<img src=x onerror=alert(1)> <script>alert(1)</script>");
+    expect(container.querySelector("script, img")).toBeNull();
+    expect(container.textContent).toContain("<script>alert(1)</script>");
+  });
+
+  it("renders common markdown blocks and inline formatting", async () => {
+    await renderMessage(
+      "# Title\n\n- **bold**\n- *italic*\n\n> quoted\n\n[docs](https://example.com)",
+    );
+    expect(container.querySelector("h1")?.textContent).toBe("Title");
+    expect(container.querySelector("ul")).toBeTruthy();
+    expect(container.querySelector("strong")?.textContent).toBe("bold");
+    expect(container.querySelector("em")?.textContent).toBe("italic");
+    expect(container.querySelector("blockquote")?.textContent).toBe("quoted");
+    expect(container.querySelector('a[href="https://example.com"]')?.textContent).toBe("docs");
+  });
+
+  it("does not create unsafe links", async () => {
+    await renderMessage("[bad](javascript:alert(1)) [data](data:text/html,evil)");
+    expect(container.querySelectorAll("a")).toHaveLength(0);
+    expect(container.textContent).toContain("bad");
+    expect(container.textContent).toContain("data");
+  });
+
+  it("renders fenced code with a language label and copy button", async () => {
+    await renderMessage("```typescript\nconst x = 1;\n```");
+    expect(container.querySelector("pre")?.textContent).toContain("const x = 1;");
+    expect(container.querySelector("[data-code-language]")?.textContent).toBe("typescript");
+    expect(container.querySelector('button[aria-label="Copy code"]')).toBeTruthy();
+    expect(container.querySelector("pre")?.className).toContain("overflow-x-auto");
+  });
+
+  it("uses high-contrast text for code and code metadata", async () => {
+    await renderMessage("Inline `path`\n\n```typescript\nconst x = 1;\n```");
+    expect(container.querySelector("p code")?.className).toContain("text-secondary-foreground");
+    expect(container.querySelector("pre")?.className).toContain("text-secondary-foreground");
+    expect(container.querySelector("pre code")?.className).toContain("text-midground");
+    expect(container.querySelector("pre code")?.className).toContain("bg-transparent");
+    expect(container.querySelector("[data-slot='code-block']")?.className).toContain("border-midground/40");
+    expect(container.querySelector("[data-code-language]")?.parentElement?.className).toContain("text-secondary-foreground");
+  });
+
+  it("adds scoped contrast hooks for inline code", async () => {
+    await renderMessage("Inline `path`");
+    expect(container.querySelector("[data-slot='markdown-message']")).toBeTruthy();
+    expect(container.querySelector("[data-slot='inline-code']")?.className).toContain("text-midground");
+    expect(container.querySelector("[data-slot='inline-code']")?.className).toContain("border-0");
+    expect(container.querySelector("[data-slot='inline-code']")?.className).toContain("rounded-sm");
+  });
+
+  it("adds readable syntax token hooks for supported code", async () => {
+    await renderMessage("```css\nbackground-color: color-mix(in srgb, currentColor 50%); /* readable */\n```");
+    expect(container.querySelector("[data-syntax-token='property']")?.textContent).toBe("background-color");
+    expect(container.querySelector("[data-syntax-token='function']")?.textContent).toBe("color-mix");
+    expect(container.querySelector("[data-syntax-token='number']")?.textContent).toBe("50%");
+    expect(container.querySelector("[data-syntax-token='comment']")?.textContent).toBe("/* readable */");
+  });
+
+  it("promotes a substantial HTML fence to an artifact card with preview and download actions", async () => {
+    const html = `<!doctype html><html><head><title>Demo app</title></head><body><main>${"content ".repeat(30)}</main></body></html>`;
+    await renderMessage(`\`\`\`html\n${html}\n\`\`\``);
+    expect(container.querySelector("[data-slot='artifact-card']")).toBeTruthy();
+    expect(container.querySelector("button[aria-label='Preview artifact']")).toBeTruthy();
+    expect(container.querySelector("button[aria-label='Download artifact']")).toBeTruthy();
+    expect(container.querySelector("pre")).toBeNull();
+  });
+
+  it("pins an artifact per session and restores the pinned state", async () => {
+    const html = `<!doctype html><html><body><main>${"persist ".repeat(30)}</main></body></html>`;
+    await renderMessage(`\`\`\`html\n${html}\n\`\`\``, "session-artifact");
+    const pin = container.querySelector<HTMLButtonElement>("button[aria-label='Pin artifact']");
+    expect(pin).toBeTruthy();
+    await act(async () => pin?.click());
+    expect(container.querySelector("[data-artifact-pinned='true']")).toBeTruthy();
+
+    await act(async () => root.unmount());
+    container.remove();
+    await renderMessage(`\`\`\`html\n${html}\n\`\`\``, "session-artifact");
+    expect(container.querySelector("button[aria-label='Unpin artifact']")).toBeTruthy();
+  });
+
+  it("copies code and reports copied state", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    await renderMessage("```js\nhello\n```");
+    const button = container.querySelector<HTMLButtonElement>('button[aria-label="Copy code"]')!;
+    await act(async () => button.click());
+    expect(writeText).toHaveBeenCalledWith("hello");
+    expect(button.textContent).toContain("Copied");
+  });
+});

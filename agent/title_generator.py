@@ -158,9 +158,30 @@ def is_titleable_user_message(user_message: str) -> bool:
             and bool(_summarize_user_message(user_message).strip()))
 
 
+
+def _strict_title_redact(text: str) -> str:
+    """Redact title text before model, persistence, or platform egress."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(
+            str(text or ""),
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        return "[REDACTED]" if text else ""
+
+
 def derive_title(user_message: str) -> Optional[str]:
     """Instant title: first meaningful line trimmed to a word boundary. No model, never fails."""
-    line = " ".join(_first_line(_summarize_user_message(user_message)).split())
+    text = _summarize_user_message(user_message)
+    if not text:
+        return None
+    line = _first_line(text)
+    if not line:
+        return None
+    line = _strict_title_redact(" ".join(line.split()))
     if len(line) > MAX_DERIVED_TITLE_CHARS:
         cut = line[:MAX_DERIVED_TITLE_CHARS]
         space = cut.rfind(" ")
@@ -206,7 +227,10 @@ def _extract_title_text(content: str) -> str:
 
 def _clean_title(text: str) -> Optional[str]:
     """Normalize a model-produced title, or None when nothing usable remains."""
-    title = _strip_title_prefix(" ".join((text or "").split()).strip("\"'").strip()).rstrip(".!,;:")
+    title = _strict_title_redact(" ".join((text or "").split()))
+    title = _strip_title_prefix(title.strip("\"'").strip()).rstrip(".!,;:")
+    if not title:
+        return None
     if len(title) > 80:
         title = title[:77].rstrip() + "..."
     return title or None
@@ -252,7 +276,9 @@ def generate_title(
             return None
     except Exception:  # fail open: a broken validator must not disable titling
         logger.debug("Title runtime validator raised; proceeding", exc_info=True)
-    user_snippet = _summarize_user_message(user_message)[:MAX_TITLE_INPUT_CHARS]
+    user_snippet = _strict_title_redact(
+        _summarize_user_message(user_message)[:MAX_TITLE_INPUT_CHARS]
+    )
     if not user_snippet.strip():
         return None
     language = _title_language()
@@ -315,6 +341,7 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
     ``ValueError`` means the name is taken by an unrelated session (the unique-title index); rather than
     leave the session untitled (#50537), append a ``#N`` suffix via ``get_next_title_in_lineage``.
     """
+    title = _strict_title_redact(title)
     auto_fn = getattr(session_db, "set_auto_title", None)
 
     def _set(candidate):

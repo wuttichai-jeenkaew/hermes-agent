@@ -470,7 +470,9 @@ _CONFIG_SETTERS = {
 @_profile_scoped
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
-    session = _sessions.get(params.get("session_id", ""))
+    session, remote_error = _require_remote_mutation_session(params, rid)
+    if remote_error:
+        return remote_error
     handler = _CONFIG_SETTERS.get(key)
     if handler is None and key.startswith("details_mode."):
         handler = _set_details_section

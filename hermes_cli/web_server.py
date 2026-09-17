@@ -925,6 +925,9 @@ def _get_dashboard_plugins(force_rescan: bool = False) -> list:
 
 # Router mounting. ORDER IS ROUTE-MATCHING ORDER: literal paths must land before
 # templated siblings (e.g. /api/sessions/bulk-delete before /api/sessions/{id}).
+# Keep the config-only scope available at the historical web_server seam so
+# external plugins and tests can continue to monkeypatch it after route extraction.
+from hermes_cli.web_server_profiles import _config_profile_scope  # noqa: E402
 from hermes_cli.web_routers import (  # noqa: E402
     files as _files_routes,
     git as _git_routes,
@@ -1579,6 +1582,10 @@ _PLUGIN_COMPAT_LAZY = {
     'WebhookEnabledToggle': ('hermes_cli.web_models', 'WebhookEnabledToggle'),
     'WhatsAppOnboardingApply': ('hermes_cli.web_models', 'WhatsAppOnboardingApply'),
     'WhatsAppOnboardingStart': ('hermes_cli.web_models', 'WhatsAppOnboardingStart'),
+    '_get_usage_quota': ('hermes_cli.web_routers.analytics', '_get_usage_quota'),
+    '_ninerouter_profile_settings': ('hermes_cli.web_routers.analytics', '_ninerouter_profile_settings'),
+    '_ninerouter_scope': ('hermes_cli.web_routers.analytics', '_ninerouter_scope'),
+    'get_usage_quota': ('hermes_cli.web_routers.analytics', 'get_usage_quota'),
     'activate_custom_endpoint': ('hermes_cli.web_routers.config_env', 'activate_custom_endpoint'),
     'add_credential_pool_entry': ('hermes_cli.web_routers.ops', 'add_credential_pool_entry'),
     'add_mcp_server': ('hermes_cli.web_routers.mcp', 'add_mcp_server'),

@@ -17,6 +17,7 @@ from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from functools import wraps
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -168,8 +169,11 @@ def _browser_controller_ws_sender(ws, loop, *, wait_timeout: float = 10.0):
             def observe_late_send(completed):
                 try:
                     completed.result()
-                except Exception:
-                    logger.exception("browser-controller websocket send failed after wait timeout")
+                except Exception as exc:
+                    logger.error(
+                        "browser-controller websocket send failed after wait timeout type=%s",
+                        type(exc).__name__,
+                    )
             future.add_done_callback(observe_late_send)
     return send
 
@@ -696,10 +700,31 @@ class ResponseStore:
         from hermes_state_wal import apply_wal_with_fallback
         apply_wal_with_fallback(self._conn, db_label="response_store.db")
         self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS responses ("
-            "response_id TEXT PRIMARY KEY, data TEXT NOT NULL, accessed_at REAL NOT NULL)")
+            """CREATE TABLE IF NOT EXISTS responses (
+                response_id TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                accessed_at REAL NOT NULL,
+                owner_scope TEXT NOT NULL DEFAULT 'default'
+            )"""
+        )
         self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS conversations (name TEXT PRIMARY KEY, response_id TEXT NOT NULL)")
+            """CREATE TABLE IF NOT EXISTS conversations (
+                name TEXT PRIMARY KEY,
+                response_id TEXT NOT NULL,
+                owner_scope TEXT NOT NULL DEFAULT 'default'
+            )"""
+        )
+        # Existing response stores predate profile/owner binding.  Migrate
+        # them fail-closed: legacy rows receive the local default scope and
+        # are never visible to a named/profile-key scope.
+        for table in ("responses", "conversations"):
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN owner_scope TEXT NOT NULL DEFAULT 'default'"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
         self._conn.commit()
         # Conversation history lives here: owner-only perms, once at init (not per commit).
         self._tighten_file_permissions()
@@ -715,29 +740,51 @@ class ResponseStore:
             except OSError:
                 logger.debug("Failed to restrict response store permissions for %s", candidate, exc_info=True)
 
-    def get(self, response_id: str) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _scope(owner_scope: str | None) -> str:
+        return str(owner_scope or "default")
+
+    @staticmethod
+    def _conversation_key(name: str, owner_scope: str | None) -> str:
+        scope = ResponseStore._scope(owner_scope)
+        return name if scope == "default" else f"{scope}\x00{name}"
+
+    def get(self, response_id: str, *, owner_scope: str | None = None) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
+        scope = self._scope(owner_scope)
         row = self._conn.execute(
-            "SELECT data FROM responses WHERE response_id = ?", (response_id,)).fetchone()
+            "SELECT data FROM responses WHERE response_id = ? AND owner_scope = ?",
+            (response_id, scope),
+        ).fetchone()
         if row is None:
             return None
         self._conn.execute(
-            "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
-            (time.time(), response_id))
+            "UPDATE responses SET accessed_at = ? WHERE response_id = ? AND owner_scope = ?",
+            (time.time(), response_id, scope),
+        )
         self._conn.commit()
         try:
             return json.loads(row[0])
         except (json.JSONDecodeError, TypeError):
-            logger.warning("Corrupted JSON in response store for id=%s, evicting entry", response_id)
-            self._conn.execute("DELETE FROM responses WHERE response_id = ?", (response_id,))
+            logger.warning(
+                "Corrupted JSON in response store for id=%s, evicting entry",
+                response_id,
+            )
+            self._conn.execute(
+                "DELETE FROM responses WHERE response_id = ? AND owner_scope = ?",
+                (response_id, scope),
+            )
             self._conn.commit()
             return None
 
-    def put(self, response_id: str, data: Dict[str, Any]) -> None:
+    def put(self, response_id: str, data: Dict[str, Any], *, owner_scope: str | None = None) -> None:
         """Store a response, evicting the oldest if at capacity."""
+        scope = self._scope(owner_scope)
         self._conn.execute(
-            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()))
+            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at, owner_scope) VALUES (?, ?, ?, ?)",
+            (response_id, json.dumps(data, default=str), time.time(), scope),
+        )
+        # Evict oldest entries beyond max_size
         count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
         if count > self._max_size:
             evict_ids = [row[0] for row in self._conn.execute(
@@ -750,21 +797,43 @@ class ResponseStore:
                 self._conn.execute(f"DELETE FROM responses WHERE response_id IN ({placeholders})", evict_ids)
         self._conn.commit()
 
-    def delete(self, response_id: str) -> bool:
-        """Remove a response (and conversation mappings to it). True if found and deleted."""
-        self._conn.execute("DELETE FROM conversations WHERE response_id = ?", (response_id,))
-        cursor = self._conn.execute("DELETE FROM responses WHERE response_id = ?", (response_id,))
+    def delete(self, response_id: str, *, owner_scope: str | None = None) -> bool:
+        """Remove a response from the store. Returns True if found and deleted."""
+        scope = self._scope(owner_scope)
+        # Clear conversation mappings pointing to this response
+        self._conn.execute(
+            "DELETE FROM conversations WHERE response_id = ? AND owner_scope = ?",
+            (response_id, scope),
+        )
+        cursor = self._conn.execute(
+            "DELETE FROM responses WHERE response_id = ? AND owner_scope = ?",
+            (response_id, scope),
+        )
         self._conn.commit()
         return cursor.rowcount > 0
 
-    def get_conversation(self, name: str) -> Optional[str]:
+    def get_conversation(self, name: str, *, owner_scope: str | None = None) -> Optional[str]:
         """Get the latest response_id for a conversation name."""
-        row = self._conn.execute("SELECT response_id FROM conversations WHERE name = ?", (name,)).fetchone()
+        key = self._conversation_key(name, owner_scope)
+        scope = self._scope(owner_scope)
+        row = self._conn.execute(
+            "SELECT response_id FROM conversations WHERE name = ? AND owner_scope = ?",
+            (key, scope),
+        ).fetchone()
         return row[0] if row else None
 
-    def set_conversation(self, name: str, response_id: str) -> None:
+    def set_conversation(self, name: str, response_id: str, *, owner_scope: str | None = None) -> None:
         """Map a conversation name to its latest response_id."""
-        self._conn.execute("INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)", (name, response_id))
+        key = self._conversation_key(name, owner_scope)
+        scope = self._scope(owner_scope)
+        self._conn.execute(
+            "DELETE FROM conversations WHERE name = ? AND owner_scope = ?",
+            (key, scope),
+        )
+        self._conn.execute(
+            "INSERT INTO conversations (name, response_id, owner_scope) VALUES (?, ?, ?)",
+            (key, response_id, scope),
+        )
         self._conn.commit()
 
     def close(self) -> None:
@@ -877,8 +946,72 @@ def _resolve_media_to_data_urls(text: str) -> str:
 
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     """Redact API-bound error text before it crosses the HTTP boundary."""
-    redacted = redact_sensitive_text(str(value), force=True)
-    return redacted[:limit] if limit is not None else redacted
+    redacted = redact_sensitive_text(
+        str(value), force=True, redact_url_credentials=True
+    )
+    if limit is not None:
+        return redacted[:limit]
+    return redacted
+
+
+_SAFE_RESPONSE_KEYS = frozenset({
+    "id", "object", "status", "created_at", "model", "output", "usage", "error",
+    "incomplete_details", "response", "type", "role", "name", "call_id", "arguments",
+    "content", "text", "result", "message", "command", "description", "title",
+    "item", "item_id", "output_index", "content_index", "sequence_number", "delta",
+    "logprobs", "status_details", "code", "input_tokens", "output_tokens",
+    "total_tokens", "reasoning_tokens", "prompt_tokens", "completion_tokens",
+})
+
+
+def _safe_response_value(value: Any, *, depth: int = 0) -> Any:
+    """Redact and allowlist nested JSON values at an API response boundary."""
+    if depth > 7:
+        return "[REDACTED]"
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return _redact_api_error_text(value)
+    if isinstance(value, (int, float)):
+        return value if math.isfinite(float(value)) else None
+    if isinstance(value, (list, tuple)):
+        return [_safe_response_value(item, depth=depth + 1) for item in value[:100]]
+    if isinstance(value, dict):
+        return {
+            key: _safe_response_value(item, depth=depth + 1)
+            for key, item in value.items()
+            if isinstance(key, str) and key in _SAFE_RESPONSE_KEYS
+        }
+    return "[REDACTED]"
+
+
+def _safe_response_payload(response: Any) -> Dict[str, Any]:
+    """Return the strict public shape for a stored Responses object."""
+    if not isinstance(response, dict):
+        return {}
+    allowed = {
+        "id", "object", "status", "created_at", "model", "output", "usage",
+        "error", "incomplete_details",
+    }
+    result = {
+        key: _safe_response_value(value)
+        for key, value in response.items()
+        if key in allowed
+    }
+    usage = result.get("usage")
+    if isinstance(usage, dict):
+        result["usage"] = {
+            key: value
+            for key, value in usage.items()
+            if key in {
+                "input_tokens", "output_tokens", "total_tokens", "reasoning_tokens",
+                "prompt_tokens", "completion_tokens",
+            }
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        }
+    return result
 
 
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
@@ -1361,6 +1494,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                        "code": "gateway_auth_failed"}},
             status=401)
 
+    def _response_store_scope(self) -> str:
+        """Return an opaque profile+credential owner scope for Responses state."""
+        profile = _api_request_profile.get() or "default"
+        key = self._expected_api_key()
+        if not key and profile == "default":
+            return "default"
+        digest = hashlib.sha256(f"{profile}\x00{key}".encode("utf-8")).hexdigest()
+        return f"{profile}:{digest[:32]}"
+
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """Validate the Bearer token; None when OK, else a 401. The no-key branch (connect()
         refuses to start without API_SERVER_KEY) exists for tests/manual wiring on the default
@@ -1425,9 +1567,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         auth_header = request.headers.get("Authorization", "")
         try:
             ok, code = await _call_verifier(verifier, auth_header)
-        except Exception:
+        except Exception as exc:
             # Fail closed: a crashing verifier must never admit the event.
-            logger.exception("Platform HTTP event verifier failed for %s", platform_name)
+            logger.error(
+                "Platform HTTP event verifier failed for %s type=%s",
+                platform_name,
+                type(exc).__name__,
+            )
             ok, code = False, "platform_event_verifier_error"
         if not ok:
             return _error_response(
@@ -1440,8 +1586,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return _error_response("Platform event must be a JSON object", 400, code="invalid_request")
         try:
             result = await dispatcher(payload)
-        except Exception:
-            logger.exception("Platform HTTP event dispatch failed for %s", platform_name)
+        except Exception as exc:
+            logger.error(
+                "Platform HTTP event dispatch failed for %s type=%s",
+                platform_name,
+                type(exc).__name__,
+            )
             return _error_response(
                 "Platform event dispatch failed", 500, err_type="server_error",
                 code="platform_event_dispatch_failed")
@@ -2253,8 +2403,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Enrichment can fetch pricing/provider catalogs: keep it off the event loop.
             payload = await asyncio.to_thread(_build_payload)
             return web.json_response(payload)
-        except Exception:
-            logger.exception("[%s] GET /api/model/options failed", self.name)
+        except Exception as exc:
+            logger.error("[%s] GET /api/model/options failed type=%s", self.name, type(exc).__name__)
             return _error_response("Failed to list model options.", 500, code="model_options_failed")
 
     @_require_auth
@@ -2405,8 +2555,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             scope = self._browser_control_broker.consume_ticket(ticket_value)
         except ControllerTicketInvalid:
             raise web.HTTPUnauthorized() from None
-        except Exception:
-            logger.exception("browser-control WS ticket consumption failed")
+        except Exception as exc:
+            logger.error("browser-control WS ticket consumption failed type=%s", type(exc).__name__)
             raise web.HTTPUnauthorized() from None
         ws = web.WebSocketResponse(heartbeat=30.0, protocols=(_BROWSER_CONTROL_WS_PROTOCOL,))
         await ws.prepare(request)
@@ -2651,8 +2801,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     skip_disabled=False, include_editorial=True
                 )
             )
-        except Exception:
-            logger.exception("GET /v1/skills failed")
+        except Exception as exc:
+            logger.error("GET /v1/skills failed type=%s", type(exc).__name__)
             return _error_response("Failed to enumerate skills", 500, err_type="server_error")
         return web.json_response({"object": "list", "data": skills})
 
@@ -2680,8 +2830,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "enabled": name in enabled_toolsets,
                     "configured": _toolset_has_keys(name, config, features=features),
                     "tools": tools})
-        except Exception:
-            logger.exception("GET /v1/toolsets failed")
+        except Exception as exc:
+            logger.error("GET /v1/toolsets failed type=%s", type(exc).__name__)
             return _error_response("Failed to enumerate toolsets", 500, err_type="server_error")
         return web.json_response({"object": "list", "platform": "api_server", "data": data})
 
@@ -3207,7 +3357,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
                 raise
             except Exception as exc:
-                logger.exception("[api_server] session chat stream failed")
+                logger.error("[api_server] session chat stream failed type=%s", type(exc).__name__)
                 self._set_run_status(
                     run_id, "failed", error=_redact_api_error_text(exc), last_event="run.failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
@@ -3494,9 +3644,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None)
         try:
             claims = await _call_verifier(verifier, **verify_kwargs)
-        except Exception:
-            # Fail closed: a crashing verifier must never admit a fire.
-            logger.exception("cron fire: verifier crashed; rejecting token")
+        except Exception as exc:
+            # Fail closed: a crashing verifier must never admit a fire — this
+            # is the only inbound that can trigger remote job execution.
+            logger.error("cron fire: verifier crashed; rejecting token type=%s", type(exc).__name__)
             claims = None
         if claims is None:
             logger.warning("cron fire: rejected invalid token: %s", self._request_audit_log_suffix(request))

@@ -77,6 +77,10 @@ def _claim_run(adapter: APIServerAdapter, run_id: str) -> None:
     adapter._run_owners[run_id] = adapter._run_idempotency_scope(request)
 
 
+def _unauthenticated_run_scope() -> str:
+    return hashlib.sha256("default\x00unauthenticated-test-listener".encode()).hexdigest()
+
+
 def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     """Create an aiohttp app with /v1/runs routes registered."""
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
@@ -529,6 +533,7 @@ class TestSteerRun:
         queue = asyncio.Queue()
         adapter._active_run_agents["run_123"] = agent
         adapter._run_streams["run_123"] = queue
+        adapter._run_owners["run_123"] = _unauthenticated_run_scope()
         adapter._set_run_status("run_123", "running")
         _claim_run(adapter, "run_123")
 
@@ -562,6 +567,7 @@ class TestSteerRun:
     @pytest.mark.asyncio
     async def test_steer_inactive_run_returns_409(self, adapter):
         app = _create_runs_app(adapter)
+        adapter._run_owners["run_done"] = _unauthenticated_run_scope()
         adapter._set_run_status("run_done", "completed")
         _claim_run(adapter, "run_done")
 
@@ -578,6 +584,7 @@ class TestSteerRun:
         agent = MagicMock()
         agent.steer.return_value = True
         adapter._active_run_agents["run_123"] = agent
+        adapter._run_owners["run_123"] = _unauthenticated_run_scope()
         adapter._set_run_status("run_123", "running")
         _claim_run(adapter, "run_123")
 
@@ -735,7 +742,7 @@ class TestRunLifecycleSweep:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once"},
+                    json={"choice": "once", "request_id": pending.data["request_id"]},
                 )
                 assert approval_resp.status == 200
                 assert pending.event.is_set()
@@ -1520,10 +1527,10 @@ class TestHostedRoomRuns:
         self, auth_adapter
     ):
         run_id = "run-room-approval"
-        current = approval_gateway_wait._ApprovalEntry({
-            "request_id": "approval-B",
-            "command": "rm -rf build-B",
-        })
+        current = approval_mod._ApprovalEntry(
+            {"command": "rm -rf build-B"},
+        )
+        current_request_id = current.data["request_id"]
         auth_adapter._run_approval_sessions[run_id] = run_id
         auth_adapter._run_statuses[run_id] = {
             "run_id": run_id,
@@ -1552,7 +1559,7 @@ class TestHostedRoomRuns:
                     )
                     exact = await cli.post(
                         f"/v1/runs/{run_id}/approval",
-                        json={"choice": "once", "request_id": "approval-B"},
+                        json={"choice": "once", "request_id": current_request_id},
                     )
                     missing_body = await missing.json()
                     stale_body = await stale.json()
@@ -1565,7 +1572,7 @@ class TestHostedRoomRuns:
         assert stale.status == 409
         assert stale_body["error"]["code"] == "approval_not_pending"
         assert exact.status == 200
-        assert exact_body["request_id"] == "approval-B"
+        assert exact_body["request_id"] == current_request_id
         assert current.result == "once"
         assert "approval" not in auth_adapter._run_statuses[run_id]
 

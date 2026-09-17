@@ -2360,6 +2360,8 @@ _env_cache: Optional[Tuple[Tuple[str, Optional[float], Optional[int]], Dict[str,
 def load_env() -> Dict[str, str]:
     """Load ~/.hermes/.env as a dict (memoised; ``get_env_value()`` runs hundreds of times per
     interactive menu render). Each assignment's value is opaque data for boundary discovery."""
+    if os.environ.get("HERMES_DISABLE_DOTENV", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return {}
     global _env_cache
     env_path = get_env_path()
 

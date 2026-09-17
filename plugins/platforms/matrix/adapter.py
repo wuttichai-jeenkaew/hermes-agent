@@ -288,6 +288,7 @@ class _MatrixApprovalPrompt:
     message_id: str
     resolved: bool = False
     requester_user_id: str | None = None
+    request_id: str | None = None
     expires_at: float | None = None
     bot_reaction_events: dict[str, str] = field(default_factory=dict, init=False)  # emoji -> event_id
 
@@ -1602,6 +1603,7 @@ class MatrixAdapter(BasePlatformAdapter):
             "You can also click the reaction to approve:\n" + "\n".join(self._EA_LEGEND[c] for c in choices))
         reactions = tuple(self._EA_REACTIONS[c] for c in choices)
         session_key, chat_id = prompt.session_key, prompt.chat_id
+        request_id = str((prompt.metadata or {}).get("approval_request_id") or "") or None
 
         def _make(message_id, requester, expires_at):
             old_event = self._approval_prompt_by_session.get(session_key)
@@ -1610,7 +1612,7 @@ class MatrixAdapter(BasePlatformAdapter):
             self._approval_prompt_by_session[session_key] = message_id
             return _MatrixApprovalPrompt(
                 session_key=session_key, chat_id=chat_id, message_id=message_id, requester_user_id=requester,
-                expires_at=expires_at)
+                request_id=request_id, expires_at=expires_at)
         return await self._send_reaction_prompt(
             chat_id, text, prompt.metadata, _make, self._approval_prompts_by_event, reactions, "approval")
 
@@ -2320,7 +2322,7 @@ class MatrixAdapter(BasePlatformAdapter):
             return handled
         try:
             from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(prompt.session_key, choice)
+            count = resolve_gateway_approval(prompt.session_key, choice, request_id=prompt.request_id) if prompt.request_id else resolve_gateway_approval(prompt.session_key, choice)
             if count:
                 prompt.resolved = True
                 self._approval_prompts_by_event.pop(reacts_to, None)

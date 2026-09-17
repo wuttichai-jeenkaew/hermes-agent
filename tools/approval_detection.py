@@ -1395,13 +1395,38 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     if len(argv) != 3 or argv[0] != "rm" or argv[1] != "-f":
         return False
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    configured_temp_dir = os.fspath(tempfile.gettempdir())
+    canonical_temp_dir = os.path.realpath(configured_temp_dir)
     basename = os.path.basename(operand)
-    return (
-        operand == os.path.join(temp_dir, basename)
-        and os.path.dirname(os.path.realpath(operand)) == temp_dir
-        and re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
+
+    def _path_text(value: str) -> str:
+        # Compare slash styles/case without normalizing `..`: traversal must
+        # remain distinguishable from the one-file canonical form.
+        return os.path.normcase(os.fspath(value).replace("\\", "/"))
+
+    canonical_configured = _path_text(canonical_temp_dir) == _path_text(
+        os.path.abspath(configured_temp_dir)
     )
+    allowed_operands = {
+        _path_text(os.path.join(canonical_temp_dir, basename)),
+    }
+    if canonical_configured:
+        # Keep the lexical temp-dir spelling as an allowed alias for platform
+        # paths such as Git Bash's `/tmp` on Windows. A symlinked temp dir is
+        # intentionally restricted to its canonical target below.
+        allowed_operands.add(
+            _path_text(os.path.join(configured_temp_dir, basename))
+        )
+        allowed_operands.add(
+            _path_text(os.path.join(os.path.abspath(configured_temp_dir), basename))
+        )
+    if _path_text(operand) not in allowed_operands:
+        return False
+
+    target = os.path.realpath(operand)
+    if _path_text(os.path.dirname(target)) != _path_text(canonical_temp_dir):
+        return False
+    return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
 
 
 def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:

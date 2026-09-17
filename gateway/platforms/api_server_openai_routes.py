@@ -933,7 +933,7 @@ class OpenAICompatRoutesMixin:
 
     async def _handle_get_response(self, request: "web.Request") -> "web.Response":
         """GET /v1/responses/{response_id} — retrieve a stored response."""
-        from gateway.platforms.api_server import _error_response
+        from gateway.platforms.api_server import _error_response, _safe_response_payload
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -941,7 +941,7 @@ class OpenAICompatRoutesMixin:
         stored = self._response_store.get(response_id)
         if stored is None:
             return _error_response(f"Response not found: {response_id}", 404)
-        return web.json_response(stored["response"])
+        return web.json_response(_safe_response_payload(stored["response"]))
 
     async def _handle_delete_response(self, request: "web.Request") -> "web.Response":
         """DELETE /v1/responses/{response_id} — delete a stored response."""
