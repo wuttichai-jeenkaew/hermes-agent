@@ -26,6 +26,9 @@ router = APIRouter()
 _open_session_db_for_profile = late("_open_session_db_for_profile", "hermes_cli.web_server_sessions")
 _session_db_path_for_profile = late("_session_db_path_for_profile", "hermes_cli.web_server_sessions")
 _profile_scope = late("_profile_scope", "hermes_cli.web_server_profiles")
+_config_profile_scope = late("_config_profile_scope", "hermes_cli.web_server_profiles")
+_load_config = late("load_config", "hermes_cli.config")
+_get_process_hermes_home = late("get_process_hermes_home", "hermes_constants")
 save_config = late("save_config", "hermes_cli.config")
 
 # ── Raw YAML config ──────────────────────────────────────────────────────────
@@ -326,15 +329,13 @@ def _ninerouter_profile_settings(
 ) -> dict[str, Optional[str] | bool]:
     from agent.secret_scope import build_profile_secret_scope
     from hermes_constants import get_hermes_home
-    from hermes_cli import web_server as _compat_web_server
 
-    get_process_hermes_home_fn = getattr(_compat_web_server, "get_process_hermes_home")
     normalized_profile = (profile or "current").strip().lower()
     allow_default_data_dir = normalized_profile == "current"
     if not allow_default_data_dir and profile_home is not None:
         try:
             allow_default_data_dir = (
-                profile_home.resolve() == get_process_hermes_home_fn().resolve()
+                profile_home.resolve() == _get_process_hermes_home().resolve()
             )
         except (OSError, RuntimeError, ValueError):
             allow_default_data_dir = False
@@ -377,12 +378,8 @@ def _get_usage_quota(profile: Optional[str] = None) -> dict:
         sanitize_scope,
     )
     from hermes_cli.runtime_provider import resolve_runtime_provider
-    from hermes_cli import web_server as _compat_web_server
 
-    config_profile_scope = getattr(_compat_web_server, "_config_profile_scope")
-    load_config_fn = getattr(_compat_web_server, "load_config")
-    get_process_hermes_home_fn = getattr(_compat_web_server, "get_process_hermes_home")
-    with config_profile_scope(profile) as scoped_profile_home:
+    with _config_profile_scope(profile) as scoped_profile_home:
         from hermes_constants import get_hermes_home
 
         profile_name = (profile or "").strip().lower()
@@ -390,21 +387,21 @@ def _get_usage_quota(profile: Optional[str] = None) -> dict:
         if not is_current_profile and scoped_profile_home is not None:
             try:
                 is_current_profile = (
-                    scoped_profile_home.resolve() == get_process_hermes_home_fn().resolve()
+                    scoped_profile_home.resolve() == _get_process_hermes_home().resolve()
                 )
             except (OSError, RuntimeError, ValueError):
                 is_current_profile = False
-        request_scope = getattr(_compat_web_server, "_ninerouter_scope")(profile)
+        request_scope = _ninerouter_scope(profile)
         profile_home = (
             scoped_profile_home
             if scoped_profile_home is not None
             else (get_hermes_home() if is_current_profile else None)
         )
-        ninerouter_settings = getattr(_compat_web_server, "_ninerouter_profile_settings")(
+        ninerouter_settings = _ninerouter_profile_settings(
             profile,
             profile_home=profile_home,
         )
-        cfg = load_config_fn() or {}
+        cfg = _load_config() or {}
         model_cfg = cfg.get("model") or {}
         configured: list[str] = []
         if isinstance(model_cfg, dict):

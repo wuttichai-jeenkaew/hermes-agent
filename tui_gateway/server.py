@@ -1364,11 +1364,8 @@ def _run_remote_command_guard(session: dict, command: str) -> dict:
                 "message": "execution profile could not be canonically resolved",
             }
         from gateway.session_context import clear_session_vars, set_session_vars
-        from tools.approval import (
-            check_all_command_guards,
-            reset_current_session_key,
-            set_current_session_key,
-        )
+        from tools.approval import check_all_command_guards
+        from tools.approval_context import reset_current_session_key, set_current_session_key
 
         agent = session.get("agent")
         durable_session_id = str(
