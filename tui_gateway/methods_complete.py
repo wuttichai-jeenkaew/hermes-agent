@@ -280,17 +280,42 @@ def _session_agent(params: dict):
 @_catch(5033)
 def _(rid, params: dict) -> dict:
     from hermes_cli.inventory import build_model_options_payload
+
+    session = _sessions.get(params.get("session_id", ""))
+    remote_session, remote_err = _remote_session_required(params, rid)
+    if remote_err:
+        return remote_err
+    if remote_session is not None:
+        session = remote_session
+    if session is not None:
+        requested_profile = str(params.get("profile") or _current_profile_name()).strip()
+        session_profile = str(session.get("profile_name") or _current_profile_name()).strip()
+        if requested_profile != session_profile:
+            return _err(rid, 4001, "model options session is outside selected profile")
     # A spawned agent owns the live provider/model/base_url; empty attributes must
     # NOT clobber disk config (with_overrides is truthy-only).
+    agent = session.get("agent") if session else None
     return _ok(rid, build_model_options_payload(
-        _model_picker_context(_session_agent(params)), explicit_only=bool(params.get("explicit_only")),
+        _model_picker_context(agent), explicit_only=bool(params.get("explicit_only")),
         include_unconfigured=bool(params.get("include_unconfigured")), refresh=bool(params.get("refresh"))))
 
 
 @method("model.save_key")
+@_profile_scoped
 @_catch(5034)
 def _(rid, params: dict) -> dict:
     """Save an API key for ``slug``; return its refreshed provider row (model.options shape + ``authenticated``)."""
+    session = _sessions.get(params.get("session_id", ""))
+    remote_session, remote_err = _remote_session_required(params, rid)
+    if remote_err:
+        return remote_err
+    if remote_session is not None:
+        session = remote_session
+    if session is not None:
+        requested_profile = str(params.get("profile") or _current_profile_name()).strip()
+        session_profile = str(session.get("profile_name") or _current_profile_name()).strip()
+        if requested_profile != session_profile:
+            return _err(rid, 4001, "model key session is outside selected profile")
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.config import is_managed
     slug, api_key = (params.get("slug") or "").strip(), (params.get("api_key") or "").strip()
@@ -309,10 +334,15 @@ def _(rid, params: dict) -> dict:
     env_var = pconfig.api_key_env_vars[0]
     from hermes_cli.credential_lifecycle import save_provider_env_credential  # also rotates stale config.yaml mirrors
     save_provider_env_credential(env_var, api_key)
-    os.environ[env_var] = api_key  # so the refreshed inventory sees it
+    # Do not copy the key into process-global os.environ: another
+    # profile's concurrent model.options request could observe it. The
+    # credential lifecycle has already persisted the profile-scoped secret;
+    # the response below marks this provider authenticated explicitly.
+
     # Shared inventory builder (lock-step with model.options / dashboard); picker_hints carries `authenticated`.
     from hermes_cli.inventory import build_models_payload
-    payload = build_models_payload(_model_picker_context(_session_agent(params)), picker_hints=True, max_models=50)
+    agent = session.get("agent") if session else None
+    payload = build_models_payload(_model_picker_context(agent), picker_hints=True, max_models=50)
     provider_data = next((p for p in payload["providers"] if p["slug"] == slug), None)
     if provider_data is None:  # key saved but provider didn't appear — still success
         provider_data = {"slug": slug, "name": pconfig.name, "is_current": False, "models": [], "total_models": 0}
@@ -321,9 +351,21 @@ def _(rid, params: dict) -> dict:
 
 
 @method("model.disconnect")
+@_profile_scoped
 @_catch(5035)
 def _(rid, params: dict) -> dict:
     """Remove all credentials (env keys AND OAuth/pool state) for provider ``slug``."""
+    session = _sessions.get(params.get("session_id", ""))
+    remote_session, remote_err = _remote_session_required(params, rid)
+    if remote_err:
+        return remote_err
+    if remote_session is not None:
+        session = remote_session
+    if session is not None:
+        requested_profile = str(params.get("profile") or _current_profile_name()).strip()
+        session_profile = str(session.get("profile_name") or _current_profile_name()).strip()
+        if requested_profile != session_profile:
+            return _err(rid, 4001, "model disconnect session is outside selected profile")
     from hermes_cli.auth import PROVIDER_REGISTRY, clear_provider_auth
     from hermes_cli.credential_lifecycle import remove_provider_env_credential
     if not (slug := (params.get("slug") or "").strip()):

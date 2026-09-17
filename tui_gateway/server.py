@@ -8,6 +8,7 @@ import importlib
 import inspect  # noqa: F401  (split modules)
 import json
 import logging
+import math
 import os
 import queue
 import subprocess
@@ -28,8 +29,8 @@ from hermes_constants import (
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from hermes_state_ids import new_session_id
-from tools.environments.local import hermes_subprocess_env
-from agent.replay_cleanup import canonicalize_replay_history
+from tools.environments.local import hermes_remote_subprocess_env, hermes_subprocess_env
+from agent.replay_cleanup import canonicalize_replay_history, sanitize_replay_history  # noqa: F401
 from agent.compaction_display import project_compaction_message_for_display  # noqa: F401
 from agent.skill_commands import describe_skill_invocation  # noqa: F401
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX  # noqa: F401
@@ -90,6 +91,10 @@ _answers: dict[str, str] = {}
 # clarify.respond (per-question lock, update-in-place), read out by _block on resolution/timeout
 # so locked answers survive the deadline.
 _batch_clarify: dict[str, dict] = {}
+# Short-lived tombstones prevent a late batch response from falling through to
+# the ordinary single-answer resolver after _block has cleaned its live state.
+_completed_prompt_ids: dict[str, float] = {}
+_COMPLETED_PROMPT_TOMBSTONE_SECONDS = 600.0
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
@@ -104,6 +109,7 @@ _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
 _SLASH_WORKER_TIMEOUT_S = max(5.0, env_float("HERMES_TUI_SLASH_TIMEOUT_S", 45.0))
+
 
 def _ws_orphan_setting(env_var: str, cfg_key: str, default: float) -> float:
     """``dashboard.<cfg_key>`` seconds; the env var is an internal override that wins when set."""
@@ -343,6 +349,38 @@ def _load_interim_assistant_messages() -> bool:
     return is_truthy_value(_display_cfg().get("interim_assistant_messages", True))
 
 
+def _session_owns_durable_lifecycle(session_id: str | None) -> bool:
+    """Whether this TUI/desktop session may end its durable DB row by key."""
+    if not session_id:
+        transport = current_transport()
+        return transport is None or transport is _stdio_transport
+    try:
+        db = _get_db()
+        if db is None:
+            return False
+        # Don't end gateway-originated sessions — the gateway owns their
+        # lifecycle. The TUI is only a viewer there (#60609).
+        row = db.get_session(session_id)
+        source = (row or {}).get("source", "")
+        return not _is_gateway_owned_source(source)
+    except Exception:
+        return False
+
+
+def _session_resume_owner_matches(session: dict | None) -> bool:
+    """Require authenticated principal ownership for remote session resume."""
+    transport = current_transport()
+    if transport is None or transport is _stdio_transport:
+        return True
+    # Non-WebSocket transports are trusted in-process callers (PTY/Desktop helpers and tests).
+    # Only the authenticated WS transport carries a remote identity boundary.
+    if not hasattr(transport, "auth_identity"):
+        return True
+    principal = _authenticated_transport_principal()
+    owner = str((session or {}).get("owner_principal") or "").strip()
+    return bool(principal and owner and owner == principal)
+
+
 def _shutdown_sessions() -> None:
     # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
     for step in (_flush_sessions_before_exit, _release_gateway_wake_owner):
@@ -484,21 +522,67 @@ def _db_unavailable_error(rid, *, code: int):
 # override) so config/skills/model/persistence resolve to it. Omitted/own profile → launch profile.
 def _profile_home(profile: str | None) -> Path | None:
     """Resolve a named profile's home on THIS host, or None for the launch profile."""
-    if not (name := _canonical_profile_request((profile or "").strip())):
+    raw_name = str(profile or "").strip()
+    if not raw_name:
         return None
-    from hermes_cli import profiles as profiles_mod
-    home = Path(profiles_mod.get_profile_dir(name))
-    if not home.is_dir():
-        raise FileNotFoundError(f"Profile '{name}' does not exist.")
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        name = profiles_mod.normalize_profile_name(raw_name)
+        profiles_mod.validate_profile_name(name)
+        home = Path(profiles_mod.get_profile_dir(name))
+        if name != "default":
+            if not home.is_dir() or home.is_symlink():
+                return None
+            try:
+                profiles_root = Path(profiles_mod._get_profiles_root()).resolve(strict=True)
+                if home.parent.resolve(strict=True) != profiles_root:
+                    return None
+                if home.resolve(strict=True) != home.absolute():
+                    return None
+            except (OSError, RuntimeError):
+                return None
+    except ValueError:
+        raise
+    except Exception:
+        return None
+    # Already the launch profile? No override needed.
     if home.resolve() == Path(_hermes_home).resolve():
-        return None  # already the launch profile (no override needed)
-    _served_profile_homes.add(home)  # the change watcher must stat every served sibling store too
-    return home
+        return None
+    if name != "default":
+        try:
+            profiles_root = Path(profiles_mod._get_profiles_root()).resolve()
+            resolved_home = home.resolve()
+            if profiles_root not in resolved_home.parents:
+                return None
+            if profiles_mod.named_profile_is_deleted(home):
+                return None
+        except Exception:
+            return None
+    if (home / "state.db").exists() or home.exists():
+        _served_profile_homes.add(home)
+        return home
+    return None
 
 
 # Profile homes served besides the launch home — the only extra stores the sessions watcher
 # probes. Empty on single-profile installs, so their watcher stays byte-identical.
 _served_profile_homes: set[Path] = set()
+
+
+def _canonical_profile_request(profile: str | None) -> str | None:
+    """Validate and resolve an RPC profile selector fail-closed."""
+    raw_name = str(profile or "").strip()
+    if not raw_name:
+        return None
+    from hermes_cli import profiles as profiles_mod
+
+    name = profiles_mod.normalize_profile_name(raw_name)
+    profiles_mod.validate_profile_name(name)
+    home = _profile_home(name)
+    if home is None and (name != _current_profile_name() and name != "default"):
+        raise ValueError(f"profile not found: {name}")
+    return name
 
 
 def _profile_scoped(handler):
@@ -513,7 +597,14 @@ def _profile_scoped(handler):
     unscoped and keep legacy ``os.environ`` precedence.
     """
     def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+        raw_profile = params.get("profile") if isinstance(params, dict) else None
+        try:
+            profile = _canonical_profile_request(raw_profile)
+        except (TypeError, ValueError) as exc:
+            return _err(rid, 4001, str(exc))
+        if isinstance(params, dict) and profile is not None and params.get("profile") != profile:
+            params = {**params, "profile": profile}
+        home = _profile_home(profile)
         if home is None:
             return handler(rid, params)
         token = set_hermes_home_override(home)
@@ -634,17 +725,101 @@ def _broadcast_global_event(event: str, payload: dict | None = None) -> None:
 
 def _approval_request_payload(data: dict | None) -> dict:
     """Build the client-safe representation of a pending approval."""
-    payload = dict(data or {})
-    if "choices" not in payload:
+    raw = dict(data or {})
+    has_request_id = isinstance(raw.get("request_id"), str) and bool(raw.get("request_id", "").strip())
+    if not has_request_id:
+        raw.pop("request_id", None)
+    # Never copy an approval record wholesale: queue entries may carry private
+    # pattern/material fields used only by the resolver or observer hooks.
+    allowed_fields = (
+        "request_id",
+        "command",
+        "description",
+        "title",
+        "choices",
+        "allow_session",
+        "allow_permanent",
+        "smart_denied",
+        "created_at",
+        "expires_at",
+    )
+    payload = {key: raw[key] for key in allowed_fields if key in raw}
+
+    for key in ("command", "description", "title"):
+        if key in payload and not isinstance(payload[key], str):
+            payload.pop(key, None)
+    for key in ("allow_session", "allow_permanent", "smart_denied"):
+        if key in payload and not isinstance(payload[key], bool):
+            payload[key] = False
+    for key in ("created_at", "expires_at"):
+        value = payload.get(key)
+        if key in payload and (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+        ):
+            payload.pop(key, None)
+
+    if "choices" in raw:
+        raw_choices = raw.get("choices")
+        if not isinstance(raw_choices, (list, tuple)):
+            # A malformed explicit capability set must never widen to the
+            # default choices. Deny is the only safe fallback.
+            choices = ["deny"]
+        else:
+            choices = [
+                choice
+                for choice in ("once", "session", "always", "deny")
+                if choice in raw_choices
+            ]
+            if payload.get("smart_denied"):
+                choices = [choice for choice in choices if choice in {"once", "deny"}]
+            else:
+                if payload.get("allow_session") is not True:
+                    choices = [choice for choice in choices if choice != "session"]
+                if payload.get("allow_permanent") is not True:
+                    choices = [choice for choice in choices if choice != "always"]
+            if "deny" not in choices:
+                choices.append("deny")
+            choices = choices or ["deny"]
+        payload["choices"] = choices
+    elif payload.get("smart_denied"):
+        payload["choices"] = ["once", "deny"]
+    else:
         choices = ["once"]
-        if not payload.get("smart_denied") and payload.get("allow_session") is not False:
+        if payload.get("allow_session") is True:
             choices.append("session")
-            if payload.get("allow_permanent") is not False:
+            if payload.get("allow_permanent") is True:
                 choices.append("always")
-        payload["choices"] = choices + ["deny"]
-    if "command" in payload:
+        choices.append("deny")
+        payload["choices"] = choices
+
+    if not has_request_id:
+        payload["choices"] = ["deny"]
+        payload.pop("allow_session", None)
+        payload.pop("allow_permanent", None)
+
+    if any(key in payload for key in ("command", "description", "title")):
         from gateway.run import _redact_approval_command
-        payload["command"] = _redact_approval_command(payload.get("command"))
+
+        if "command" in payload and isinstance(payload.get("command"), str):
+            try:
+                payload["command"] = _redact_approval_command(payload.get("command"))
+            except Exception:
+                payload["command"] = "[REDACTED]"
+        for key in ("description", "title"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                try:
+                    from agent.redact import redact_sensitive_text
+
+                    payload[key] = redact_sensitive_text(
+                        value,
+                        force=True,
+                        redact_url_credentials=True,
+                    )
+                except Exception:
+                    payload[key] = "[REDACTED]"
     return payload
 
 
@@ -1069,10 +1244,93 @@ def _start_agent_build(sid: str, session: dict) -> None:
     build_thread.start()
 
 
+def _remote_session_access_error(params: dict, rid, session: dict | None):
+    """Fail-closed ownership/profile gate for every remote session RPC."""
+    transport = current_transport()
+    if transport is None or transport is _stdio_transport:
+        return None
+    # Non-WebSocket transports are trusted in-process callers; remote identity checks apply only
+    # to the server-authenticated WS transport, which always exposes auth_identity.
+    if not hasattr(transport, "auth_identity"):
+        return None
+    principal = _authenticated_transport_principal()
+    owner = str((session or {}).get("owner_principal") or "").strip()
+    if not principal or not owner or principal != owner:
+        return _err(rid, 4032, "session is not owned by authenticated principal")
+    try:
+        requested_profile = _canonical_profile_request(params.get("profile")) or _current_profile_name()
+    except (TypeError, ValueError) as exc:
+        return _err(rid, 4001, str(exc))
+    stored_profile = str((session or {}).get("profile_name") or "").strip()
+    if not stored_profile or stored_profile != requested_profile:
+        return _err(rid, 4031, "session is outside selected profile")
+    if stored_profile != "default":
+        stored_home = str((session or {}).get("profile_home") or "").strip()
+        canonical_home = _profile_home(stored_profile)
+        if not stored_home or canonical_home is None:
+            return _err(rid, 4031, "session has no canonical profile home")
+        try:
+            if Path(stored_home).resolve() != Path(canonical_home).resolve():
+                return _err(rid, 4031, "session profile home mismatch")
+        except (OSError, RuntimeError):
+            return _err(rid, 4031, "session profile home is invalid")
+    return None
+
+
+def _remote_session_required(params: dict, rid):
+    """Require an authenticated, owned session for remote session RPCs."""
+    transport = current_transport()
+    if transport is None or transport is _stdio_transport:
+        return None, None
+    sid = str(params.get("session_id") or "").strip()
+    if not sid:
+        return None, _err(rid, 4032, "session_id required for remote session operation")
+    return _sess_nowait(params, rid)
+
+
+def _require_remote_mutation_session(params: dict, rid):
+    """Resolve the session required by remote global-state mutations.
+
+    Local stdio callers retain the historical optional-session behavior. A
+    network caller must name an owned, profile-bound live session before a
+    mutation can touch launch/profile-global state.
+    """
+    transport = current_transport()
+    if transport is None or transport is _stdio_transport:
+        sid = str(params.get("session_id") or "").strip()
+        return (_sessions.get(sid) if sid else None), None
+    return _remote_session_required(params, rid)
+
+
+def _remote_owned_session_ids(params: dict, rid) -> set[str] | None:
+    """Return identifiers of live sessions owned by this remote principal.
+
+    Durable rows from older installs do not carry an authenticated principal, so
+    remote historical listing/control is deny-by-default unless it can be tied
+    to a live, owner-bound session record.
+    """
+    transport = current_transport()
+    if transport is None or transport is _stdio_transport:
+        return None
+    visible: set[str] = set()
+    with _sessions_lock:
+        snapshot = list(_sessions.items())
+    for sid, session in snapshot:
+        if _remote_session_access_error(params, rid, session) is not None:
+            continue
+        for value in (sid, session.get("session_key"), session.get("stored_session_id")):
+            if value:
+                visible.add(str(value))
+    return visible
+
+
 def _sess_nowait(params, rid):
     sid = params.get("session_id") or ""
     s = _sessions.get(sid)
     if s:
+        access_err = _remote_session_access_error(params, rid, s)
+        if access_err:
+            return (None, access_err)
         return (s, None)
     # Stale runtime id (reaped/evicted/TTL): the client should session.resume the STORED id. Logged so
     # "message vanished" reads as "arrived and was rejected".
@@ -1086,6 +1344,77 @@ def _sess_nowait(params, rid):
                    "(detached/reaped runtime; client should resume the stored session), rid=%r",
                    _current_rpc_method.get() or "?", sid, rid)
     return (None, _err(rid, 4001, "session not found"))
+
+
+def _run_remote_command_guard(session: dict, command: str) -> dict:
+    """Apply the shared approval policy before a remote subprocess starts."""
+    if not isinstance(command, str) or not command.strip():
+        return {"approved": False, "message": "empty command"}
+    session_key = str(session.get("session_key") or "").strip()
+    profile_name = str(session.get("profile_name") or "").strip()
+    if not session_key or not profile_name:
+        return {
+            "approved": False,
+            "message": "execution approval context is incomplete",
+        }
+    try:
+        if _approval_profile_home_for_name(profile_name) is None:
+            return {
+                "approved": False,
+                "message": "execution profile could not be canonically resolved",
+            }
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.approval import (
+            check_all_command_guards,
+            reset_current_session_key,
+            set_current_session_key,
+        )
+
+        agent = session.get("agent")
+        durable_session_id = str(
+            getattr(agent, "session_id", None) or session_key
+        ).strip()
+        tokens = set_session_vars(
+            platform="dashboard",
+            source=_session_source(session) or "dashboard",
+            session_key=session_key,
+            session_id=durable_session_id,
+            profile=profile_name,
+            cwd=_session_cwd(session),
+            ui_session_id="",
+            cron_session="",
+        )
+        approval_token = set_current_session_key(session_key)
+        try:
+            result = check_all_command_guards(
+                command,
+                "local",
+                has_host_access=True,
+            )
+        finally:
+            reset_current_session_key(approval_token)
+            clear_session_vars(tokens)
+        if not isinstance(result, dict):
+            return {
+                "approved": False,
+                "message": "execution approval returned an invalid decision",
+            }
+        return result
+    except Exception:
+        # Approval is a safety boundary: an unavailable context or policy
+        # implementation must stop execution rather than fall through.
+        logger.warning("remote command approval guard failed", exc_info=True)
+        return {
+            "approved": False,
+            "message": "execution approval could not be completed",
+        }
+
+
+def _shell_exec_argv(command: str) -> list[str]:
+    """Run shell-compatible text through an explicit platform shell."""
+    if os.name == "nt":
+        return ["cmd.exe", "/d", "/s", "/c", command]
+    return ["/bin/sh", "-c", command]
 
 
 def _sess(params, rid):
@@ -1295,17 +1624,63 @@ def _clarify_timeout_seconds() -> float | None:
     return 300
 
 
+def _redact_prompt_value(value) -> str:
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(str(value or ""), force=True, redact_url_credentials=True)
+    except Exception:
+        return "[REDACTED]"
+
+
+def _redact_prompt_choices(choices) -> list[str] | None:
+    if choices is None:
+        return None
+    if not isinstance(choices, (list, tuple)):
+        return ["[REDACTED]"]
+    return [_redact_prompt_value(choice) for choice in choices if isinstance(choice, str)]
+
+
 def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
     """Bridge the clarify tool callback onto _block. Single-question payloads keep their historical shape
     (``multi_select`` only when True — older renderers never see a new field); batch calls emit one
     clarify.request with only the wire fields (the tool-side entries carry result-assembly keys too)."""
     if questions:
-        wire = [{"qid": e["qid"], "question": e["question"], "choices": e["choices"], "multi_select": bool(e["multi_select"])}
-                for e in questions]
-        return _block("clarify.request", sid, {"questions": wire}, timeout=_clarify_timeout_seconds(),
-                      batch_qids=[e["qid"] for e in questions])
-    payload = {"question": q, "choices": c, "multi_select": True} if multi_select else {"question": q, "choices": c}
-    return _block("clarify.request", sid, payload, timeout=_clarify_timeout_seconds())
+        wire = [
+            {
+                "qid": entry["qid"],
+                "question": _redact_prompt_value(entry["question"]),
+                "choices": _redact_prompt_choices(entry["choices"]),
+                "multi_select": bool(entry["multi_select"]),
+            }
+            for entry in questions
+        ]
+        return _block(
+            "clarify.request",
+            sid,
+            {"questions": wire},
+            timeout=_clarify_timeout_seconds(),
+            batch_qids=[entry["qid"] for entry in questions],
+        )
+    # multi_select is a pass-through hint: renderers with checkbox
+    # support can honor it; older renderers ignore the extra field
+    # and stay single-select (a single answer still parses as a
+    # one-element list on the tool side). Only emitted when True so
+    # single-select payloads keep the exact pre-multi-select shape.
+    return _block(
+        "clarify.request",
+        sid,
+        (
+            {
+                "question": _redact_prompt_value(q),
+                "choices": _redact_prompt_choices(c),
+                "multi_select": True,
+            }
+            if multi_select
+            else {"question": _redact_prompt_value(q), "choices": _redact_prompt_choices(c)}
+        ),
+        timeout=_clarify_timeout_seconds(),
+    )
 
 
 # A tour action is a DOM op the renderer answers in ms; the generous deadline exists only because a
@@ -1388,10 +1763,61 @@ def _resolve_session_platform() -> str:
     return "desktop" if desktop and not is_truthy_value(os.environ.get("HERMES_DESKTOP_TERMINAL")) else "tui"
 
 
+def _authenticated_transport_principal() -> str | None:
+    """Return a stable server-minted principal for the active WS transport."""
+    transport = current_transport()
+    if transport is None or not hasattr(transport, "auth_identity"):
+        return None
+    identity = getattr(transport, "auth_identity", None)
+    if not isinstance(identity, dict):
+        return None
+    user_id = str(identity.get("user_id") or "").strip()
+    provider = str(identity.get("provider") or "").strip().lower()
+    if not user_id or not provider:
+        return None
+    return f"{provider}:{user_id}"
+
+
+def _authenticated_transport_source(explicit: str | None) -> str | None:
+    """Resolve source from server-owned WS auth, never from RPC params."""
+    transport = current_transport()
+    if transport is None or not hasattr(transport, "auth_identity"):
+        return None
+    identity = getattr(transport, "auth_identity", None)
+    if not isinstance(identity, dict) or not str(identity.get("user_id") or "").strip():
+        raise ValueError("authenticated transport identity required")
+    provider = str(identity.get("provider") or "").strip().lower()
+    authenticated_source = "server-internal" if provider == "internal" else "dashboard"
+    requested = str(explicit or "").strip()
+    if requested and requested != authenticated_source:
+        # Internal branch/continuation builds may carry the source of a parent session. Accept
+        # that source only when the server already owns a session bound to this exact transport;
+        # arbitrary RPC-supplied source values remain rejected.
+        with _sessions_lock:
+            inherited = any(
+                record.get("transport") is transport and str(record.get("source") or "").strip() == requested
+                for record in _sessions.values()
+            )
+        if not inherited:
+            raise ValueError("source is not owned by authenticated transport")
+        return requested
+    return authenticated_source
+
+
 def _resolve_session_source(explicit: str | None) -> str:
-    """Session DB ``source``: an explicit caller value (plugin session tagged ``"telegram"``) is never
-    rewritten; only empty/None falls back to the env-resolved platform."""
-    return explicit or _resolve_session_platform()
+    """Default the session DB ``source`` field from the resolved platform.
+
+    A caller that explicitly passes ``source`` (e.g. a plugin session tagged
+    ``"telegram"``) keeps its value. Only an empty/None ``source`` falls back
+    to the env-resolved platform — so env-driven resolution never silently
+    rewrites a caller's intent.
+    """
+    authenticated_source = _authenticated_transport_source(explicit)
+    if authenticated_source is not None:
+        return authenticated_source
+    if explicit:
+        return explicit
+    return _resolve_session_platform()
 
 
 def _resolve_agent_platform(source: str | None) -> str:
@@ -2426,22 +2852,49 @@ def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "", profile:
 
 
 def _deferred_session_record(
-    session_key: str, *, cols: int, cwd: str, history: list, lease, source: str = "tui",
-    close_on_disconnect: bool = False, display_history_prefix: list | None = None,
-    profile_home: Path | None = None, lazy: bool = False, model_override=None,
-    resume_runtime_overrides: dict | None = None, todo_state: dict | None = None,
-    explicit_cwd: bool = False) -> dict:
+    session_key: str,
+    *,
+    cols: int,
+    cwd: str,
+    history: list,
+    lease,
+    source: str = "tui",
+    close_on_disconnect: bool = False,
+    continue_on_disconnect: bool = False,
+    display_history_prefix: list | None = None,
+    profile_home: Path | None = None,
+    profile_name: str | None = None,
+    lazy: bool = False,
+    model_override=None,
+    resume_runtime_overrides: dict | None = None,
+    todo_state: dict | None = None,
+    explicit_cwd: bool = False,
+) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold resume) — _init_session's shape minus the agent."""
     now = time.time()
+    approval_profile_name = str(
+        profile_name or _current_profile_name() or "default"
+    ).strip() or "default"
+    approval_profile_home = (
+        Path(profile_home)
+        if profile_home is not None
+        else _approval_profile_home_for_name(approval_profile_name)
+    )
     return {
         "agent": None, "agent_error": None, "agent_ready": threading.Event(), "attached_images": [],
-        "close_on_disconnect": close_on_disconnect, "active_session_lease": lease, "cols": cols,
+        "close_on_disconnect": close_on_disconnect, "continue_on_disconnect": continue_on_disconnect,
+        "active_session_lease": lease, "cols": cols,
         "created_at": now, "cwd": cwd, "display_history_prefix": display_history_prefix or [],
         "edit_snapshots": {}, "explicit_cwd": bool(explicit_cwd), "history": history,
         "history_lock": threading.Lock(), "history_version": 0, "image_counter": 0,
         "inflight_turn": None, "last_active": now, "lazy": lazy, "model_override": model_override,
+        "owner_principal": _authenticated_transport_principal(),
+        "approval_profile_home": (
+            str(approval_profile_home) if approval_profile_home is not None else None
+        ),
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
+        "profile_name": approval_profile_name,
         "resume_runtime_overrides": resume_runtime_overrides, "resume_session_id": session_key,
         "running": False, "session_key": session_key, "show_reasoning": _load_show_reasoning(),
         "slash_worker": None, "source": source, "tool_progress_mode": _load_tool_progress_mode(),
@@ -2638,6 +3091,7 @@ def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
         "last_active": float(session.get("last_active") or session.get("created_at") or now),
         "message_count": len(history),
         "model": str(getattr(agent, "model", "") or _resolve_model()), "preview": preview,
+        "profile": str(session.get("profile_name") or _current_profile_name()),
         "session_key": key, "started_at": float(session.get("created_at") or now), "status": status,
         "title": _session_live_title(session, key),
     }
@@ -2673,7 +3127,9 @@ def _fallback_session_info(session: dict) -> dict:
     cwd = _session_cwd(session)
     return {
         "cwd": cwd, "branch": git_probe.branch(cwd), "project": _project_info_for_cwd(cwd), "lazy": True,
-        "model": _resolve_model(), "skills": {}, "tools": {}, "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+        "model": _resolve_model(), "skills": {}, "tools": {},
+        "profile_name": str(session.get("profile_name") or _current_profile_name()),
+        "desktop_contract": DESKTOP_BACKEND_CONTRACT,
     }
 
 
@@ -3056,22 +3512,104 @@ def _start_usage_ticker(sid: str, agent, interval: float = 1.0) -> tuple[threadi
 
 def _respond(rid, params, key, *, allow_expired=False):
     r = params.get("request_id", "")
+    if not isinstance(r, str) or not r.strip():
+        return _err(rid, 4006, "request_id required")
     question_id = str(params.get("question_id") or "")
+    transport = current_transport()
+    is_remote = transport is not None and transport is not _stdio_transport
     with _prompt_lock:
+        now = time.monotonic()
+        for completed_id, completed_at in list(_completed_prompt_ids.items()):
+            if now - completed_at >= _COMPLETED_PROMPT_TOMBSTONE_SECONDS:
+                _completed_prompt_ids.pop(completed_id, None)
+        if r in _completed_prompt_ids:
+            return _err(rid, 4091, "request already resolved")
         entry = _pending.get(r)
         if not entry:
-            return _ok(rid, {"status": "expired"}) if allow_expired and r else _err(rid, 4009, f"no pending {key} request")
+            if allow_expired and r:
+                return _ok(rid, {"status": "expired"})
+            return _err(rid, 4009, f"no pending {key} request")
+        owner_sid, ev = entry
+        expected_event = {
+            "clarify.respond": "clarify.request",
+            "terminal.read.respond": "terminal.read.request",
+            "preview.read.respond": "preview.read.request",
+            "preview.act.respond": "preview.act.request",
+            "window.read.respond": "window.read.request",
+            "tour.respond": "tour.request",
+            "mcp.setup.respond": "mcp.setup.request",
+            "sudo.respond": "sudo.request",
+            "secret.respond": "secret.request",
+        }.get(_current_rpc_method.get())
+        pending_event, _pending_payload = _pending_prompt_payloads.get(r, ("", {}))
+        if expected_event is None or pending_event != expected_event:
+            return _err(rid, 4002, "response method does not match pending request")
+        requested_sid = str(params.get("session_id") or "").strip()
+        if requested_sid and requested_sid != owner_sid:
+            return _err(rid, 4001, "response session does not own request")
+        owner_session = _sessions.get(owner_sid)
+        if is_remote:
+            if not requested_sid:
+                return _err(rid, 4001, "session_id required for remote response")
+            if owner_session is None or not _session_resume_owner_matches(owner_session):
+                return _err(rid, 4032, "response session is not owned by authenticated principal")
+            owner_profile = str(owner_session.get("profile_name") or "").strip()
+            if not owner_profile:
+                return _err(rid, 4031, "response session has no canonical profile")
+            raw_profile = params.get("profile")
+            if raw_profile is None or raw_profile == "":
+                current_profile = str(_current_profile_name() or "default").strip() or "default"
+                if owner_profile != current_profile:
+                    return _err(rid, 4031, "response profile is required")
+            else:
+                try:
+                    response_profile = _canonical_profile_request(raw_profile)
+                except (TypeError, ValueError) as exc:
+                    return _err(rid, 4001, str(exc))
+                if response_profile != owner_profile:
+                    return _err(rid, 4031, "response profile does not own request")
         _, ev = entry
         batch = _batch_clarify.get(r)
+        if batch is not None and not question_id:
+            answer = params.get(key, "")
+            if answer != "":
+                return _err(rid, 4002, "question_id required for batch clarify response")
+            if r in _answers or batch.get("finalized"):
+                return _err(rid, 4091, "request already resolved")
+            batch["finalized"] = True
+            _completed_prompt_ids[r] = time.monotonic()
+            _answers[r] = ""
+            ev.set()
+            return _ok(rid, {"status": "cancelled", "remaining": []})
+        if batch is None and question_id:
+            return _err(rid, 4002, "question_id is not valid for a single-question request")
         if batch is not None and question_id:
-            # Per-question lock; update-in-place so an answer stays editable until every qid is locked (Confirm).
+            if batch.get("finalized"):
+                return _err(rid, 4091, "request already resolved")
+            # Per-question lock (multi-question clarify). Update-in-place is
+            # deliberate: a locked answer stays editable until the batch
+            # completes, and completion is exactly "every qid locked" — the
+            # final lock is the Confirm-and-continue click.
             if question_id not in batch["qids"]:
                 return _err(rid, 4002, f"unknown question_id {question_id!r}")
-            batch["answers"][question_id] = params.get(key, "")
-            if not (remaining := [qid for qid in batch["qids"] if qid not in batch["answers"]]):
+            answer = params.get(key, "")
+            if not isinstance(answer, str):
+                return _err(rid, 4003, f"{key} must be a string")
+            batch["answers"][question_id] = answer
+            remaining = [
+                qid for qid in batch["qids"] if qid not in batch["answers"]
+            ]
+            if not remaining:
+                batch["finalized"] = True
+                _completed_prompt_ids[r] = time.monotonic()
                 ev.set()
             return _ok(rid, {"status": "ok", "remaining": remaining})
-        _answers[r] = params.get(key, "")
+        if r in _answers:
+            return _err(rid, 4091, "request already resolved")
+        value = params.get(key, "")
+        if not isinstance(value, str):
+            return _err(rid, 4003, f"{key} must be a string")
+        _answers[r] = value
         ev.set()
     return _ok(rid, {"status": "ok"})
 

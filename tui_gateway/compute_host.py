@@ -388,6 +388,32 @@ class ComputeHost:
                 self._reply("control.error", sid, request_id, message=error)
             elif route_name == "reload.mcp":
                 self._handle_reload_mcp({**frame, "type": "reload_mcp"})
+            elif route_name == "approval.respond":
+                response_params = dict(frame.get("params") or {}) if isinstance(frame.get("params"), dict) else {}
+                response_params.setdefault("session_id", sid)
+                response = server.handle_request({
+                    "id": request_id,
+                    "method": "approval.respond",
+                    "params": response_params,
+                })
+                if not isinstance(response, dict) or "error" in response:
+                    raw_error_code = (response.get("error") or {}).get("code") if isinstance(response, dict) else None
+                    error_code = raw_error_code if isinstance(raw_error_code, int) and not isinstance(raw_error_code, bool) else 4009
+                    self.emit({
+                        "type": "control.error",
+                        "sid": sid,
+                        "request_id": request_id,
+                        "error_code": error_code,
+                        "message": "compute-host approval response was rejected",
+                    })
+                else:
+                    self.emit({
+                        "type": "control.ack",
+                        "sid": sid,
+                        "request_id": request_id,
+                        "route_name": route_name,
+                        "result": response.get("result") or {},
+                    })
             else:
                 ack = self._control_ack(server, frame, session)
                 if "error" in ack:

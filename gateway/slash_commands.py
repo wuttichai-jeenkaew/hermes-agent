@@ -1134,16 +1134,40 @@ class GatewaySlashCommandsMixin(
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve — unblock waiting agent thread(s). They block inside tools/approval.py;
         signalling the event resumes them so the command executes inline (same flow as the CLI)."""
-        from tools.approval import resolve_gateway_approval
         session_key, stale = self._blocking_approval_or_stale(event, "gateway.approval_expired",
                                                               "gateway.approve.no_pending")
         if stale:
             return stale
-        # Args: "all", "all session", "all always", "session", "always" ("always" beats "session").
+        from tools.approval import resolve_gateway_approval, list_gateway_approvals
+
+        # Parse args: support "all", "<request_id>", "all session", "session", "always"
         args = event.get_command_args().strip().lower().split()
-        choices = {_APPROVE_CHOICE_BY_ARG[a] for a in args if a in _APPROVE_CHOICE_BY_ARG}
-        choice = "always" if "always" in choices else "session" if "session" in choices else "once"
-        count = resolve_gateway_approval(session_key, choice, resolve_all="all" in args)
+        pending_request_ids = {
+            str(item.get("request_id") or "")
+            for item in list_gateway_approvals(session_key)
+            if item.get("request_id")
+        }
+        request_id = None
+        if args and args[0] in pending_request_ids:
+            request_id = args.pop(0)
+        resolve_all = "all" in args
+        if request_id is None and not resolve_all:
+            return "Approval request ID required. Use /approve <request_id> [once|session|always]."
+        remaining = [a for a in args if a != "all"]
+
+        if any(a in {"always", "permanent", "permanently"} for a in remaining):
+            choice = "always"
+        elif any(a in {"session", "ses"} for a in remaining):
+            choice = "session"
+        else:
+            choice = "once"
+
+        count = resolve_gateway_approval(
+            session_key,
+            choice,
+            resolve_all=resolve_all,
+            request_id=request_id,
+        )
         if not count:
             return t("gateway.approve.no_pending")
         confirmation_text = t(f"gateway.approve.{choice}_{'plural' if count > 1 else 'singular'}", count=count)
@@ -1157,18 +1181,38 @@ class GatewaySlashCommandsMixin(
         ``/deny <reason>`` (or ``/deny all <reason>``) attaches a one-line reason that is relayed back to
         the agent so it can adapt instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
         """
-        from tools.approval import resolve_gateway_approval
         session_key, stale = self._blocking_approval_or_stale(event, "gateway.deny.stale",
                                                               "gateway.deny.no_pending")
         if stale:
             return stale
-        # A leading "all" denies every pending command; the rest (or the whole arg string without
-        # "all") is the optional deny reason relayed to the agent, capped to a sane one-liner.
+        from tools.approval import resolve_gateway_approval, list_gateway_approvals
         raw_args = event.get_command_args().strip()
         tokens = raw_args.split()
+        pending_request_ids = {
+            str(item.get("request_id") or "")
+            for item in list_gateway_approvals(session_key)
+            if item.get("request_id")
+        }
+        request_id = None
         resolve_all = bool(tokens) and tokens[0].lower() == "all"
-        reason = (raw_args[len(tokens[0]):].strip() if resolve_all else raw_args)[:280].strip()
-        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all, reason=reason or None)
+        if resolve_all:
+            reason = raw_args[len(tokens[0]):].strip()
+        elif tokens and tokens[0] in pending_request_ids:
+            request_id = tokens[0]
+            reason = raw_args[len(tokens[0]):].strip()
+        else:
+            return "Approval request ID required. Use /deny <request_id> [reason], or /deny all [reason]."
+        # Cap to a sane one-liner; the agent only needs a short hint.
+        if reason:
+            reason = reason[:280].strip()
+
+        count = resolve_gateway_approval(
+            session_key,
+            "deny",
+            resolve_all=resolve_all,
+            request_id=request_id,
+            reason=reason or None,
+        )
         if not count:
             return t("gateway.deny.no_pending")
         logger.info("User denied %d dangerous command(s) via /deny%s", count,

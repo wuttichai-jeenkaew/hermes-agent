@@ -1980,8 +1980,9 @@ class RelayAdapter(BasePlatformAdapter):
         (success=False) so run.py's button→text fallback runs."""
         options = [{"id": choice, "label": label, **({"style": style} if style else {})}
                    for label, choice, style in prompt.actions]
+        request_id = str((prompt.metadata or {}).get("approval_request_id") or "")
         result = await self._mint_and_send_prompt(
-            "exec_approval", {"session_key": prompt.session_key}, prompt.chat_id, prompt_kind="approval",
+            "exec_approval", {"session_key": prompt.session_key, "request_id": request_id}, prompt.chat_id, prompt_kind="approval",
             text=prompt.text, options=options, metadata=prompt.metadata,
         )
         return result if result is not None else self._PROMPT_UNAVAILABLE
@@ -2095,8 +2096,14 @@ class RelayAdapter(BasePlatformAdapter):
     async def _resolve_exec_approval(self, state, option_id, chat_id, ack_meta) -> None:
         from tools.approval import resolve_gateway_approval
 
+        session_key = str(state.get("session_key") or "")
+        request_id = str(state.get("request_id") or "") or None
         choice = option_id if option_id in _EXEC_APPROVAL_LABELS else "deny"
-        count = resolve_gateway_approval(str(state.get("session_key") or ""), choice)
+        count = resolve_gateway_approval(
+            session_key,
+            choice,
+            request_id=request_id,
+        ) if request_id else resolve_gateway_approval(session_key, choice)
         label = _EXEC_APPROVAL_LABELS[choice] if count else "⌛ Approval expired — no command was waiting."
         # In-channel ack preserves the audit trail the native edit gives (the
         # connector's prompt message can't be edited cross-platform yet).

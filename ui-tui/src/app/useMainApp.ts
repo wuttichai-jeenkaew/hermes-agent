@@ -53,7 +53,7 @@ import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import { type GatewayRpc, type StateSetter, type TranscriptRow } from './interfaces.js'
-import { $overlayState, patchOverlayState } from './overlayStore.js'
+import { $overlayState, dismissApproval, patchOverlayState } from './overlayStore.js'
 import { $goodVibesTick } from './petFlashStore.js'
 import { scrollWithSelectionBy } from './scroll.js'
 import { turnController } from './turnController.js'
@@ -145,6 +145,10 @@ export async function startPromptLiveSession({
   dispatchSubmission(trimmed)
 
   return sid
+}
+
+export function approvalResponseResolved(result: unknown): boolean {
+  return typeof result === 'object' && result !== null && (result as { resolved?: unknown }).resolved === 1;
 }
 
 export function useMainApp(gw: GatewayClient) {
@@ -685,7 +689,11 @@ export function useMainApp(gw: GatewayClient) {
           scrollRef.current.scrollToBottom()
         }
 
-        void rpc<TerminalResizeResponse>('terminal.resize', { cols: stdout.columns ?? 80, session_id: ui.sid })
+        void rpc<TerminalResizeResponse>('terminal.resize', {
+          cols: stdout.columns ?? 80,
+          profile: ui.info?.profile_name || 'default',
+          session_id: ui.sid
+        })
       }, 100)
     }
 
@@ -695,7 +703,7 @@ export function useMainApp(gw: GatewayClient) {
       clearTimeout(timer)
       stdout.off('resize', onResize)
     }
-  }, [rpc, stdout, ui.sid])
+  }, [rpc, stdout, ui.info?.profile_name, ui.sid])
 
   const answerClarify = useCallback(
     (answer: string) => {
@@ -710,7 +718,12 @@ export function useMainApp(gw: GatewayClient) {
       turnController.turnTools = turnController.turnTools.filter(line => !sameToolTrailGroup(label, line))
       patchTurnState({ turnTrail: turnController.turnTools })
 
-      rpc<ClarifyRespondResponse>('clarify.respond', { answer, request_id: clarify.requestId }).then(r => {
+      rpc<ClarifyRespondResponse>('clarify.respond', {
+        answer,
+        request_id: clarify.requestId,
+        session_id: ui.sid,
+        profile: ui.info?.profile_name || 'default'
+      }).then(r => {
         if (!r) {
           return
         }
@@ -740,7 +753,7 @@ export function useMainApp(gw: GatewayClient) {
         patchOverlayState({ clarify: null })
       })
     },
-    [appendMessage, overlay.clarify, rpc]
+    [appendMessage, overlay.clarify, rpc, ui.info?.profile_name, ui.sid]
   )
 
   // Lock one answer of a batch clarify (clarify.respond + question_id). The
@@ -757,7 +770,9 @@ export function useMainApp(gw: GatewayClient) {
       rpc<ClarifyRespondResponse & { remaining?: string[] }>('clarify.respond', {
         answer,
         question_id: qid,
-        request_id: clarify.requestId
+        request_id: clarify.requestId,
+        session_id: ui.sid,
+        profile: ui.info?.profile_name || 'default'
       }).then(r => {
         if (!r) {
           return
@@ -794,7 +809,7 @@ export function useMainApp(gw: GatewayClient) {
         patchOverlayState({ clarify: null })
       })
     },
-    [appendMessage, overlay.clarify, rpc]
+    [appendMessage, overlay.clarify, rpc, ui.info?.profile_name, ui.sid]
   )
 
   sysRef.current = sys
@@ -1016,18 +1031,40 @@ export function useMainApp(gw: GatewayClient) {
   slashRef.current = slash
 
   const respondWith = useCallback(
-    (method: string, params: Record<string, unknown>, done: () => void) => rpc(method, params).then(r => r && done()),
+    (
+      method: string,
+      params: Record<string, unknown>,
+      done: () => void,
+      isSuccessful: (result: Record<string, any>) => boolean = result => Boolean(result)
+    ) => rpc(method, params).then(result => {
+      if (result && isSuccessful(result)) {
+        done()
+      }
+      return result
+    }),
     [rpc]
   )
 
   const answerApproval = useCallback(
-    (choice: string) =>
-      respondWith('approval.respond', { choice, session_id: ui.sid }, () => {
-        patchOverlayState({ approval: null })
-        patchTurnState({ outcome: choice === 'deny' ? 'denied' : `approved (${choice})` })
-        patchUiState({ status: 'running…' })
-      }),
-    [respondWith, ui.sid]
+    (choice: string) => {
+      const requestId = overlay.approval?.requestId
+      return respondWith(
+        'approval.respond',
+        {
+          choice,
+          profile: ui.info?.profile_name || 'default',
+          request_id: requestId,
+          session_id: ui.sid
+        },
+        () => {
+          dismissApproval(requestId)
+          patchTurnState({ outcome: choice === 'deny' ? 'denied' : `approved (${choice})` })
+          patchUiState({ status: 'running…' })
+        },
+        approvalResponseResolved
+      )
+    },
+    [overlay.approval?.requestId, respondWith, ui.info?.profile_name, ui.sid]
   )
 
   const answerSudo = useCallback(
@@ -1038,16 +1075,17 @@ export function useMainApp(gw: GatewayClient) {
 
       const requestId = overlay.sudo.requestId
 
-      if (!pw) {
-        patchOverlayState({ sudo: null })
-      }
-
-      return respondWith('sudo.respond', { password: pw, request_id: requestId }, () => {
+      return respondWith('sudo.respond', {
+        password: pw,
+        profile: ui.info?.profile_name || 'default',
+        request_id: requestId,
+        session_id: ui.sid
+      }, () => {
         patchOverlayState({ sudo: null })
         patchUiState({ status: 'running…' })
       })
     },
-    [overlay.sudo, respondWith]
+    [overlay.sudo, respondWith, ui.info?.profile_name, ui.sid]
   )
 
   const answerSecret = useCallback(
@@ -1058,16 +1096,17 @@ export function useMainApp(gw: GatewayClient) {
 
       const requestId = overlay.secret.requestId
 
-      if (!value) {
-        patchOverlayState({ secret: null })
-      }
-
-      return respondWith('secret.respond', { request_id: requestId, value }, () => {
+      return respondWith('secret.respond', {
+        profile: ui.info?.profile_name || 'default',
+        request_id: requestId,
+        session_id: ui.sid,
+        value
+      }, () => {
         patchOverlayState({ secret: null })
         patchUiState({ status: 'running…' })
       })
     },
-    [overlay.secret, respondWith]
+    [overlay.secret, respondWith, ui.info?.profile_name, ui.sid]
   )
 
   const answerVaultUnlock = useCallback(

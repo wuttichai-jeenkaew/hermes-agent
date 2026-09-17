@@ -1,8 +1,32 @@
-"""QQ Bot inline keyboards + approval / update-prompt helpers. A button click dispatches an
-``INTERACTION_CREATE`` event carrying the button's ``data``; the bot must ACK promptly via
-``PUT /interactions/{id}`` or the user sees an error indicator. ``button_data`` formats:
-``approve:<session_key>:<decision>`` (allow-once|allow-always|deny) and ``update_prompt:<answer>`` (y|n).
-Ported from WideLee's qqbot-agent-sdk v1.2.2 (authorship via Co-authored-by)."""
+"""QQ Bot inline keyboards + approval / update-prompt senders.
+
+QQ Bot v2 supports attaching inline keyboards to outbound messages. When a
+user clicks a button, the platform dispatches an ``INTERACTION_CREATE``
+gateway event containing the button's ``data`` payload. The bot must ACK the
+interaction promptly via ``PUT /interactions/{id}`` or the user sees an
+error indicator on the button.
+
+This module provides:
+
+- :class:`InlineKeyboard` + button dataclasses — serialized into the
+  ``keyboard`` field of the outbound message body.
+- :func:`build_approval_keyboard` — 3-button ✅ once / ⭐ always / ❌ deny
+  keyboard for tool-approval flows.
+- :func:`build_update_prompt_keyboard` — Yes/No keyboard for update confirms.
+- :func:`parse_approval_button_data` / :func:`parse_update_prompt_button_data`
+  — decode the ``button_data`` payload from ``INTERACTION_CREATE``.
+- :class:`ApprovalRequest` + :class:`ApprovalSender` — high-level helper that
+  builds an approval message with keyboard and posts it to a c2c / group chat.
+
+``button_data`` formats::
+
+    approve:<session_key>:rid:<request_id>:<decision>
+                                           # decision = allow-once|allow-always|deny
+    update_prompt:<answer>                # answer = y|n
+
+Ported from WideLee's qqbot-agent-sdk v1.2.2 (``approval.py`` + ``dto.py``
+keyboard types). Authorship preserved via Co-authored-by.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +39,9 @@ UPDATE_PROMPT_PREFIX = "update_prompt:"
 
 # session_key may itself contain colons (agent:main:qqbot:c2c:OPENID): greedy group, decision trails.
 _APPROVAL_DATA_RE = re.compile(r"^approve:(.+):(allow-once|allow-always|deny)$")
+_APPROVAL_EXACT_DATA_RE = re.compile(
+    r"^approve:(.+):rid:([A-Za-z0-9_-]+):(allow-once|allow-always|deny)$"
+)
 _UPDATE_PROMPT_RE = re.compile(r"^update_prompt:(y|n)$")
 
 def _to_dict(value: Any) -> Any:
@@ -77,9 +104,17 @@ class InlineKeyboard(_Serializable):
     content: KeyboardContent = field(default_factory=KeyboardContent)
 
 
-def parse_approval_button_data(button_data: str) -> Optional[tuple[str, str]]:
-    """Parse approval ``button_data`` into ``(session_key, decision)`` or ``None``."""
-    return m.groups() if (m := _APPROVAL_DATA_RE.match(button_data or "")) else None
+def parse_approval_button_data(button_data: str) -> Optional[tuple]:
+    """Reject legacy ID-less approval payloads."""
+    return None
+
+
+def parse_approval_button_data_exact(button_data: str) -> Optional[tuple[str, str, str]]:
+    """Parse a server-bound approval button into session, request ID, choice."""
+    m = _APPROVAL_EXACT_DATA_RE.match(button_data or "")
+    if not m:
+        return None
+    return m.group(1), m.group(2), m.group(3)
 
 
 def parse_update_prompt_button_data(button_data: str) -> Optional[str]:
@@ -96,10 +131,17 @@ def _single_row_keyboard(group_id: str, *buttons: tuple) -> InlineKeyboard:
     return InlineKeyboard(content=KeyboardContent(rows=[row]))
 
 
-def build_approval_keyboard(session_key: str, *, allow_permanent: bool = True) -> InlineKeyboard:
+def build_approval_keyboard(
+    session_key: str,
+    *,
+    allow_permanent: bool = True,
+    request_id: Optional[str] = None,
+) -> InlineKeyboard:
     """Build ``[✅ 允许一次] [⭐ 始终允许] [❌ 拒绝]`` (one group, so a click greys the rest). ⭐ is hidden when
     persistent scope is unavailable; *session_key* rides in ``button_data`` so the decision routes correctly."""
-    prefix = f"{APPROVAL_BUTTON_PREFIX}{session_key}"
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise ValueError("request_id is required for approval buttons")
+    prefix = f"{APPROVAL_BUTTON_PREFIX}{session_key}:rid:{request_id.strip()}"
     buttons = [("allow", "✅ 允许一次", "已允许", f"{prefix}:allow-once", 1)]
     if allow_permanent:
         buttons.append(("always", "⭐ 始终允许", "已始终允许", f"{prefix}:allow-always", 1))
@@ -115,8 +157,7 @@ def build_update_prompt_keyboard() -> InlineKeyboard:
 
 @dataclass
 class ApprovalRequest:
-    """Approval-request display data. ``command_preview`` / ``cwd`` are set for exec approvals, ``tool_name``
-    for plugin approvals; ``severity`` is ``'critical' | 'info' | ''``."""
+    """Approval-request display data. ``command_preview`` / ``cwd`` are set for exec approvals, ``tool_name`` for plugin approvals; ``request_id`` is server-owned exact ID; ``severity`` is `critical` | `info` | `"""
     session_key: str
     title: str
     description: str = ""
@@ -125,6 +166,7 @@ class ApprovalRequest:
     tool_name: str = ""
     severity: str = ""
     timeout_sec: int = 120
+    request_id: str = ""
     allow_permanent: bool = True
 
 
@@ -240,7 +282,7 @@ class ApprovalSender:
         :returns: ``True`` on success, ``False`` on failure.
         """
         text = build_approval_text(req)
-        keyboard = build_approval_keyboard(req.session_key)
+        keyboard = build_approval_keyboard(req.session_key, request_id=req.request_id)
 
         logger.info(
             "[%s] Sending approval request to %s:%s (session=%.20s…)",

@@ -181,6 +181,38 @@ export interface SessionCreateResponse {
   session_id: string
 }
 
+export interface ApprovalRequestSnapshot {
+  allow_permanent?: boolean
+  choices?: string[]
+  command?: string
+  description?: string
+  request_id?: string
+  smart_denied?: boolean
+}
+
+export interface ClarificationRequestSnapshot {
+  answers?: Record<string, string>
+  choices?: string[] | null
+  multi_select?: boolean
+  question?: string
+  questions?: { choices?: string[] | null; multi_select?: boolean; qid: string; question: string }[]
+  request_id?: string
+}
+
+export interface SessionResumeResponse {
+  inflight?: null | SessionInflightTurn
+  info?: SessionInfo
+  message_count?: number
+  messages: GatewayTranscriptMessage[]
+  pending_approval?: ApprovalRequestSnapshot
+  pending_clarify?: ClarificationRequestSnapshot
+  resumed?: string
+  running?: boolean
+  session_id: string
+  started_at?: number
+  status?: LiveSessionStatus
+}
+
 export type LiveSessionStatus = 'idle' | 'starting' | 'waiting' | 'working'
 
 export interface SessionActiveItem {
@@ -205,6 +237,8 @@ export interface SessionActivateResponse {
   info?: SessionInfo
   message_count?: number
   messages: GatewayTranscriptMessage[]
+  pending_approval?: ApprovalRequestSnapshot
+  pending_clarify?: ClarificationRequestSnapshot
   running?: boolean
   session_id: string
   session_key?: string
@@ -253,6 +287,7 @@ export interface SessionUsageResponse {
   context_used?: number
   cost_status?: 'estimated' | 'exact'
   cost_usd?: number
+  account_lines?: string[]
   credits_lines?: string[]
   input?: number
   model?: string
@@ -322,6 +357,7 @@ export interface ClarifyRespondResponse {
 
 export interface ApprovalRespondResponse {
   ok?: boolean
+  resolved?: number
 }
 
 export interface SudoRespondResponse {

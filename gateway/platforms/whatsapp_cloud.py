@@ -207,7 +207,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # the gateway resolver. Popped on tap; FIFO-capped via bounded_put so ignored
         # prompts don't accumulate (an evicted tap degrades to text fallback).
         self._clarify_state: "OrderedDict[str, str]" = OrderedDict()
-        self._exec_approval_state: "OrderedDict[str, str]" = OrderedDict()
+        self._exec_approval_state: "OrderedDict[str, dict[str, str]]" = OrderedDict()
         self._slash_confirm_state: "OrderedDict[str, str]" = OrderedDict()
         self._runner = self._http_client = None
 
@@ -474,8 +474,16 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         interactive = self._button_interactive(
             self._truncate_body(prompt.text),
             (f"appr:{approval_id}:approve", "✅ Approve"), (f"appr:{approval_id}:deny", "❌ Deny"))
+        state_value: object = (
+            {
+                "session_key": prompt.session_key,
+                "request_id": str((prompt.metadata or {}).get("approval_request_id") or ""),
+            }
+            if (prompt.metadata or {}).get("approval_request_id")
+            else prompt.session_key
+        )
         return await self._send_interactive(
-            prompt.chat_id, interactive, prompt.metadata, self._exec_approval_state, approval_id, prompt.session_key)
+            prompt.chat_id, interactive, prompt.metadata, self._exec_approval_state, approval_id, state_value)
 
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str, metadata: Optional[Dict[str, Any]] = None,
@@ -863,17 +871,28 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     async def _handle_approval_tap(self, to: str, inner: Dict[str, Any], parts: list) -> bool:
         _, approval_id, choice = parts
-        session_key = self._pop_tap_state(
+        approval_state = self._pop_tap_state(
             self._exec_approval_state, approval_id,
             "[whatsapp_cloud] approval tap with no matching state (approval_id=%s) — likely stale; falling back to text",
             choice, ("approve", "deny"),
         )
+        if not approval_state:
+            return False
+        if isinstance(approval_state, dict):
+            session_key = str(approval_state.get("session_key") or "")
+            request_id = str(approval_state.get("request_id") or "") or None
+        else:
+            session_key = str(approval_state or "")
+            request_id = None
         if not session_key:
             return False
         approval = _optional_module("tools.approval", "[whatsapp_cloud] approval resolver unavailable")
         if approval is None:
             return False
-        count = approval.resolve_gateway_approval(session_key, choice)
+        resolved_choice = "once" if choice == "approve" else "deny"
+        count = approval.resolve_gateway_approval(
+            session_key, resolved_choice, request_id=request_id
+        ) if request_id else approval.resolve_gateway_approval(session_key, resolved_choice)
         # A tap after the wait timed out (count == 0) must not claim approval:
         # the command was already denied fail-closed.
         if count:

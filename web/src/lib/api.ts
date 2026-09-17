@@ -92,6 +92,7 @@ const PROFILE_SCOPED_PREFIXES = [
   "/api/model/auxiliary",
   "/api/model/moa",
   "/api/model/options",
+  "/api/audio",
   // A named profile keeps its own pairing whitelist, and its gateway only
   // consults that one — approving into the global store would grant access
   // the running gateway never sees.
@@ -345,6 +346,20 @@ function appendSessionFilters(url: string, options: SessionQueryOptions): string
 export const api = {
   buildWsUrl,
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
+  transcribeAudio: (dataUrl: string, mimeType: string, profile = getManagementProfile()) =>
+    fetchJSON<{ ok: boolean; transcript?: string; provider?: string }>(appendProfileParam("/api/audio/transcribe", profile), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data_url: dataUrl, mime_type: mimeType }),
+    }),
+  speakText: (text: string, profile = getManagementProfile()) =>
+    fetchJSON<{ ok: boolean; data_url?: string; mime_type?: string; provider?: string }>(appendProfileParam("/api/audio/speak", profile), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    }),
+  getVoiceConfig: (profile = getManagementProfile()) =>
+    fetchJSON<{ ok: boolean; mode?: string; stt?: Record<string, unknown>; tts?: Record<string, unknown> }>(appendProfileParam("/api/audio/voice-config", profile)),
   /**
    * Identity probe for the dashboard auth gate (Phase 7).
    *
@@ -523,6 +538,8 @@ export const api = {
     fetchJSON<ModelsAnalyticsResponse>(
       appendProfileParam(`/api/analytics/models?days=${days}`, profile),
     ),
+  getUsageQuota: (profile = getManagementProfile()) =>
+    fetchJSON<UsageQuotaResponse>(appendProfileParam("/api/usage/quota", profile)),
   getConfig: (profile = getManagementProfile()) =>
     fetchJSON<Record<string, unknown>>(appendProfileParam("/api/config", profile)),
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
@@ -2172,6 +2189,51 @@ export interface AnalyticsSkillsSummary {
   total_skill_edits: number;
   total_skill_actions: number;
   distinct_skills_used: number;
+}
+
+export interface UsageQuotaWindow {
+  label: string;
+  used_percent: number | null;
+  reset_at: string | null;
+  detail: string | null;
+}
+
+export type UsageQuotaRouteStatus = "reported" | "unknown" | "unavailable";
+
+export interface UsageQuotaRoute {
+  route: string;
+  provider: string | null;
+  account?: string | null;
+  usage: number | null;
+  limit: number | null;
+  remaining: number | null;
+  remaining_percent?: number | null;
+  unit: string | null;
+  reset_at: string | null;
+  status: UsageQuotaRouteStatus;
+  source: string;
+  detail: string | null;
+}
+
+export interface UsageQuotaSnapshot {
+  provider: string;
+  source: string;
+  fetched_at: string;
+  title: string;
+  plan: string | null;
+  windows: UsageQuotaWindow[];
+  details: string[];
+  routes?: UsageQuotaRoute[];
+  unavailable_reason: string | null;
+  available: boolean;
+  /** Provider metadata is always present on the quota response. */
+  scope: string | null;
+  stale: boolean;
+  partial: boolean;
+}
+
+export interface UsageQuotaResponse {
+  providers: UsageQuotaSnapshot[];
 }
 
 export interface AnalyticsResponse {

@@ -316,6 +316,7 @@ def load_hermes_dotenv(
     hermes_home: str | os.PathLike | None = None,
     project_env: str | os.PathLike | None = None,
     load_external_secrets: bool = True,
+    load_dotenv_files: bool | None = None,
 ) -> list[Path]:
     """Load Hermes env files: ``~/.hermes/.env`` overrides stale shell exports; project ``.env`` is a dev
     fallback that only fills gaps when the user env exists (and overrides shell vars when it does not)."""
@@ -344,29 +345,38 @@ def load_hermes_dotenv(
         return []
 
     loaded: list[Path] = []
+    if load_dotenv_files is None:
+        load_dotenv_files = os.environ.get("HERMES_DISABLE_DOTENV", "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
-    if user_env.exists():  # normalize formatting / strip NULs before parsing
-        _sanitize_env_file_if_needed(user_env)
-    if project_env_path and project_env_path.exists():
-        _sanitize_env_file_if_needed(project_env_path)
+    if load_dotenv_files:
+        if user_env.exists():  # normalize formatting / strip NULs before parsing
+            _sanitize_env_file_if_needed(user_env)
+        if project_env_path and project_env_path.exists():
+            _sanitize_env_file_if_needed(project_env_path)
 
-    if user_env.exists():
-        _load_dotenv_with_fallback(user_env, override=True)
-        loaded.append(user_env)
-        _clear_known_keys_missing_from_dotenv(user_env)  # mirrors reload_env(): inherited keys must not leak
+        if user_env.exists():
+            _load_dotenv_with_fallback(user_env, override=True)
+            loaded.append(user_env)
+            _clear_known_keys_missing_from_dotenv(user_env)  # mirrors reload_env(): inherited keys must not leak
 
-    # .op.env AFTER .env so .env wins, but the bootstrap OP_SERVICE_ACCOUNT_TOKEN reaches
-    # apply_onepassword_secrets() even in cron with no shell state; gitignored so the token never enters
-    # the committed .env. override=False lets a systemd `EnvironmentFile=-…/.op.env` token win.
-    op_env = home_path / ".op.env"
-    if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
-        _load_dotenv_with_fallback(op_env, override=False)
+        # .op.env AFTER .env so .env wins, but the bootstrap OP_SERVICE_ACCOUNT_TOKEN reaches
+        # apply_onepassword_secrets() even in cron with no shell state; gitignored so the token never enters
+        # the committed .env. override=False lets a systemd `EnvironmentFile=-…/.op.env` token win.
+        op_env = home_path / ".op.env"
+        if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
+            _load_dotenv_with_fallback(op_env, override=False)
 
-    if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not loaded)
-        loaded.append(project_env_path)
+        if project_env_path and project_env_path.exists():
+            _load_dotenv_with_fallback(project_env_path, override=not loaded)
+            loaded.append(project_env_path)
 
     # External sources are skipped for the updater (dotenv + managed env still load): ``update`` must not
     # import optional secret-manager libs (Bitwarden → cryptography → _rust.pyd) into the process replacing
@@ -416,6 +426,8 @@ def _reapply_terminal_config_bridge(home_path: Path) -> None:
 def _apply_managed_env() -> None:
     """Apply the managed-scope .env last, with override, so it beats user/shell. Does NOT stop the agent
     from later mutating os.environ (v1 relies on filesystem permissions). Fail-open: never blocks startup."""
+    if os.environ.get("HERMES_DISABLE_DOTENV", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return
     try:
         from hermes_cli import managed_scope
 

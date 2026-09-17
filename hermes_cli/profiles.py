@@ -660,6 +660,27 @@ def set_profile_display_name(profile_name: str, display_name: str) -> str:
     return cleaned
 
 
+def _safe_named_profile_entry(entry: Path, profiles_root: Path) -> Path | None:
+    """Return a canonical named-profile home only when it is safe to serve."""
+    try:
+        root = profiles_root.resolve(strict=True)
+        if entry.parent.resolve(strict=True) != root:
+            return None
+        if not entry.is_dir():
+            return None
+        # Reject symlinked/reparse-like entries even when they happen to point
+        # back inside the root; profile identity must be a real direct child.
+        if entry.is_symlink():
+            return None
+        unresolved = entry.absolute()
+        resolved = entry.resolve(strict=True)
+        if resolved != unresolved or root not in resolved.parents:
+            return None
+        return resolved
+    except (OSError, RuntimeError):
+        return None
+
+
 # CRUD operations
 
 def _profile_info(name: str, path: Path, *, is_default: bool, alias_name: Optional[str] = None) -> ProfileInfo:
@@ -707,7 +728,17 @@ def profiles_to_serve(multiplex: bool) -> List[Tuple[str, Path]]:
     profiles skipped). Pure directory read: never creates a profile dir (#94590)."""
     active = get_active_profile_name() or "default"
     if not multiplex:
-        return [(active, get_profile_dir(active))]
+        if active == "default":
+            default_home = _get_default_hermes_home()
+            return [("default", default_home)] if default_home.is_dir() else []
+        profiles_root = _get_profiles_root()
+        active_entry = profiles_root / active
+        safe_active = _safe_named_profile_entry(active_entry, profiles_root)
+        if safe_active is None or named_profile_is_deleted(safe_active):
+            logger.error("Refusing to serve unsafe or missing active profile: %s", active)
+            return []
+        return [(active, safe_active)]
+
     serve: List[Tuple[str, Path]] = [("default", _get_default_hermes_home())]
     serve.extend((entry.name, entry) for entry in _iter_named_profile_dirs())
     return serve

@@ -75,6 +75,7 @@
   "tool.complete",
   "tool.generating",
   "tool.output_risk",
+  "tool.progress",
   "tool.start",
   "tour.expire",
   "tour.request",
