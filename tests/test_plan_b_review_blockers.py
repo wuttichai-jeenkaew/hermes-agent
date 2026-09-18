@@ -14,6 +14,8 @@ from unittest.mock import patch
 import pytest
 
 import tools.approval as approval
+import tools.approval_context as approval_context
+import tools.approval_prompt as approval_prompt
 import tui_gateway.server as server
 
 
@@ -191,16 +193,19 @@ def test_per_request_timeout_is_reflected_in_queue_metadata(monkeypatch):
     assert result["value"]["resolved"] is False
 
 
-def test_mcp_cli_choice_accepts_only_once(monkeypatch):
-    """MCP elicitation must not turn session/always into per-call consent."""
-    monkeypatch.setattr(approval, "get_current_session_key", lambda: "plan-b-session")
-    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
-    monkeypatch.setattr(
-        approval,
-        "prompt_dangerous_approval",
-        lambda *_args, **_kwargs: "session",
-    )
-    assert approval.request_elicitation_consent("msg", "desc") == "decline"
+def test_mcp_cli_choice_is_per_call_only(monkeypatch):
+    """MCP elicitation accepts the current call without persisting a scope."""
+    monkeypatch.setattr(approval_context, "get_current_session_key", lambda: "plan-b-session")
+    monkeypatch.setattr(approval_context, "_is_gateway_approval_context", lambda: False)
+    captured = {}
+
+    def fake_prompt(*_args, **kwargs):
+        captured.update(kwargs)
+        return "session"
+
+    monkeypatch.setattr(approval_prompt, "prompt_dangerous_approval", fake_prompt)
+    assert approval_prompt.request_elicitation_consent("msg", "desc") == "accept"
+    assert captured["allow_permanent"] is False
 
 
 def test_approval_payload_is_allowlisted_and_url_redacted(monkeypatch):
